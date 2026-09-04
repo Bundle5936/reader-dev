@@ -107,6 +107,10 @@ pub struct BookSource {
     #[serde(rename = "ruleRelated")]
     #[sqlx(rename = "rule_related")]
     pub rule_related: Option<serde_json::Value>,
+    /// 原生段评规则（legacy `ruleReview`；保留完整 JSON 供 review API/UI 使用）
+    #[serde(rename = "ruleReview")]
+    #[sqlx(rename = "rule_review")]
+    pub rule_review: Option<serde_json::Value>,
     #[serde(rename = "searchRule")]
     #[sqlx(rename = "search_rule")]
     pub search_rule: Option<serde_json::Value>,

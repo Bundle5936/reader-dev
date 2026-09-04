@@ -412,6 +412,37 @@ export interface BookSource {
   weight: number
   exploreUrl?: string | null
   searchUrl?: string | null
+  ruleReview?: Record<string, unknown> | null
+  [key: string]: unknown
+}
+
+/** 原生段评条目（/reader3/getReviewDetail/getReviewReplies；字段对齐 legado DetailItem） */
+export interface ReviewItem {
+  id?: string | null
+  avatar?: string | null
+  name?: string | null
+  replyToName?: string | null
+  badges: string[]
+  content?: string | null
+  imageUrl?: string | null
+  audioUrl?: string | null
+  time?: string | null
+  likeCount?: number | null
+  replyCount?: number | null
+  replies: ReviewItem[]
+  [key: string]: unknown
+}
+
+export interface ReviewSummary {
+  counts: Record<string, number>
+  keys: Record<string, string>
+  [key: string]: unknown
+}
+
+export interface ReviewPage {
+  items: ReviewItem[]
+  nextPageUrl?: string | null
+  hasMore: boolean
   [key: string]: unknown
 }
 

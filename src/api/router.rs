@@ -371,6 +371,19 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
             "/reader3/getBookContent",
             get(get_book_content).post(get_book_content),
         )
+        // 原生段评（只读：summary/detail/replies；page 为 1-based）
+        .route(
+            "/reader3/getReviewSummary",
+            get(get_review_summary).post(get_review_summary),
+        )
+        .route(
+            "/reader3/getReviewDetail",
+            get(get_review_detail).post(get_review_detail),
+        )
+        .route(
+            "/reader3/getReviewReplies",
+            get(get_review_replies).post(get_review_replies),
+        )
         // 差距补全批：多格式导出 / 书源调试 / 整书缓存 / 用户配置 / 本地书刷新 / 批量接口 / 书源健康 / 阅读统计
         .route("/reader3/exportBook", get(export_book).post(export_book))
         // legacy 书籍级阅读配置持久化（YueduApi.kt:371）
@@ -2814,6 +2827,301 @@ async fn search_book_source(
     Json(ReturnData::ok(
         serde_json::to_value(matched).unwrap_or(serde_json::Value::Null),
     ))
+}
+
+/// 原生段评请求上下文：`url` 是书架 bookUrl，`index` 是 0-based 章节索引；
+/// Web 阅读器会额外传 `chapterUrl`，Android/其他客户端则从目录缓存反查。
+async fn resolve_review_context(
+    state: &AppState,
+    ns: &str,
+    params: &HashMap<String, String>,
+    body: Option<&Value>,
+) -> Result<
+    (
+        crate::model::book::Book,
+        crate::model::book_chapter::BookChapter,
+        crate::model::BookSource,
+    ),
+    String,
+> {
+    let book_url = {
+        let value = param_of(params, body, "url");
+        if value.is_empty() {
+            param_of(params, body, "bookUrl")
+        } else {
+            value
+        }
+    };
+    if book_url.trim().is_empty() {
+        return Err("请输入书籍链接".to_string());
+    }
+    let index_text = param_of(params, body, "index");
+    let index = index_text
+        .parse::<i64>()
+        .map_err(|_| "参数 index 无效".to_string())?;
+    if index < 0 {
+        return Err("参数 index 无效".to_string());
+    }
+    let book = state
+        .storage
+        .find_book(ns, &book_url)
+        .await
+        .map_err(|_| "读取书籍失败".to_string())?
+        .ok_or_else(|| "未找到书籍".to_string())?;
+    let source = state
+        .storage
+        .find_book_source(ns, &book.origin)
+        .await
+        .map_err(|_| "读取书源失败".to_string())?
+        .ok_or_else(|| "未找到书源".to_string())?;
+
+    let requested_url = param_of(params, body, "chapterUrl");
+    let requested_title = {
+        let value = param_of(params, body, "title");
+        if value.is_empty() {
+            param_of(params, body, "chapterTitle")
+        } else {
+            value
+        }
+    };
+    let mut chapter = crate::model::book_chapter::BookChapter {
+        title: requested_title,
+        url: requested_url,
+        index,
+        ..Default::default()
+    };
+    // remote 书的章节通常只在 toc_cache 中，缓存键优先使用 book.toc_url，
+    // 同时兼容早期实现把 bookUrl 作为目录缓存键的情况。
+    if chapter.url.is_empty() {
+        let mut cache_keys = Vec::new();
+        if !book.toc_url.is_empty() {
+            cache_keys.push(book.toc_url.clone());
+        }
+        if book.book_url != book.toc_url {
+            cache_keys.push(book.book_url.clone());
+        }
+        'cache: for key in cache_keys {
+            let Ok(Some(raw)) = state
+                .storage
+                .get_toc_cache(ns, &key, TOC_CACHE_TTL_MS)
+                .await
+            else {
+                continue;
+            };
+            let Ok(chapters) = serde_json::from_str::<Vec<Value>>(&raw) else {
+                continue;
+            };
+            if let Some(item) = chapters.get(index as usize) {
+                chapter.url = item
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if chapter.title.is_empty() {
+                    chapter.title = item
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                }
+                break 'cache;
+            }
+        }
+    }
+    if chapter.url.is_empty() {
+        return Err("未找到章节".to_string());
+    }
+    if chapter.title.is_empty() {
+        chapter.title = format!("第{}章", index + 1);
+    }
+    Ok((book, chapter, source))
+}
+
+fn review_para_index(
+    params: &HashMap<String, String>,
+    body: Option<&Value>,
+) -> Result<i64, String> {
+    let text = param_of(params, body, "paraIndex");
+    let index = text
+        .parse::<i64>()
+        .map_err(|_| "参数 paraIndex 无效".to_string())?;
+    if index != -1 && index <= 0 {
+        return Err("参数 paraIndex 无效".to_string());
+    }
+    Ok(index)
+}
+
+fn review_page(params: &HashMap<String, String>, body: Option<&Value>) -> Result<u32, String> {
+    let text = param_of(params, body, "page");
+    if text.is_empty() {
+        return Ok(1);
+    }
+    let page = text
+        .parse::<u32>()
+        .map_err(|_| "参数 page 无效".to_string())?;
+    if page == 0 {
+        return Err("参数 page 无效".to_string());
+    }
+    Ok(page)
+}
+
+/// GET/POST /reader3/getReviewSummary：返回 `{counts, keys}`。
+async fn get_review_summary(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.as_deref().and_then(|b| serde_json::from_slice::<Value>(b).ok());
+    let (book, chapter, source) = match resolve_review_context(
+        &state,
+        &namespace,
+        &params,
+        body_json.as_ref(),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return Json(ReturnData::err(error)),
+    };
+    match crate::service::review::get_summary(&namespace, &source, &book, &chapter).await {
+        Ok(result) => Json(ReturnData::ok(
+            serde_json::to_value(result).unwrap_or(Value::Null),
+        )),
+        Err(error) => {
+            tracing::warn!("getReviewSummary 失败 [{}]: {error:#}", source.book_source_name);
+            Json(ReturnData::err(format!("段评统计加载失败: {error}")))
+        }
+    }
+}
+
+/// GET/POST /reader3/getReviewDetail：一级段评分页。
+async fn get_review_detail(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.as_deref().and_then(|b| serde_json::from_slice::<Value>(b).ok());
+    let para_index = match review_para_index(&params, body_json.as_ref()) {
+        Ok(value) => value,
+        Err(error) => return Json(ReturnData::err(error)),
+    };
+    let page = match review_page(&params, body_json.as_ref()) {
+        Ok(value) => value,
+        Err(error) => return Json(ReturnData::err(error)),
+    };
+    let para_data = {
+        let value = param_of(&params, body_json.as_ref(), "paraData");
+        if value.is_empty() {
+            para_index.to_string()
+        } else {
+            value
+        }
+    };
+    let (book, chapter, source) = match resolve_review_context(
+        &state,
+        &namespace,
+        &params,
+        body_json.as_ref(),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return Json(ReturnData::err(error)),
+    };
+    match crate::service::review::get_detail(
+        &namespace,
+        &source,
+        &book,
+        &chapter,
+        para_index,
+        &para_data,
+        page,
+    )
+    .await
+    {
+        Ok(result) => Json(ReturnData::ok(
+            serde_json::to_value(result).unwrap_or(Value::Null),
+        )),
+        Err(error) => {
+            tracing::warn!("getReviewDetail 失败 [{}]: {error:#}", source.book_source_name);
+            Json(ReturnData::err(format!("段评加载失败: {error}")))
+        }
+    }
+}
+
+/// GET/POST /reader3/getReviewReplies：某条段评的回复分页。
+async fn get_review_replies(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.as_deref().and_then(|b| serde_json::from_slice::<Value>(b).ok());
+    let para_index = match review_para_index(&params, body_json.as_ref()) {
+        Ok(value) => value,
+        Err(error) => return Json(ReturnData::err(error)),
+    };
+    let page = match review_page(&params, body_json.as_ref()) {
+        Ok(value) => value,
+        Err(error) => return Json(ReturnData::err(error)),
+    };
+    let review_id = param_of(&params, body_json.as_ref(), "reviewId");
+    if review_id.trim().is_empty() {
+        return Json(ReturnData::err("参数 reviewId 不能为空"));
+    }
+    let para_data = {
+        let value = param_of(&params, body_json.as_ref(), "paraData");
+        if value.is_empty() {
+            para_index.to_string()
+        } else {
+            value
+        }
+    };
+    let (book, chapter, source) = match resolve_review_context(
+        &state,
+        &namespace,
+        &params,
+        body_json.as_ref(),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return Json(ReturnData::err(error)),
+    };
+    match crate::service::review::get_replies(
+        &namespace,
+        &source,
+        &book,
+        &chapter,
+        para_index,
+        &para_data,
+        &review_id,
+        page,
+    )
+    .await
+    {
+        Ok(result) => Json(ReturnData::ok(
+            serde_json::to_value(result).unwrap_or(Value::Null),
+        )),
+        Err(error) => {
+            tracing::warn!("getReviewReplies 失败 [{}]: {error:#}", source.book_source_name);
+            Json(ReturnData::err(format!("段评回复加载失败: {error}")))
+        }
+    }
 }
 
 /// 解析书源参数（完整 JSON 或 URL 查库）

@@ -812,6 +812,7 @@ const RULE_FIELDS: RuleField[] = [
   { key: 'tocRule', label: 'tocRule', tip: '目录规则 JSON（legado 命名别名，与 ruleToc 二选一）', kind: 'json' },
   { key: 'ruleContent', label: 'ruleContent', tip: '正文规则 JSON：content / nextContentUrl / sourceRegex（contentType 等字段可一并写入）', kind: 'json' },
   { key: 'contentRule', label: 'contentRule', tip: '正文规则 JSON（legado 命名别名，与 ruleContent 二选一）', kind: 'json' },
+  { key: 'ruleReview', label: 'ruleReview', tip: '原生段评规则 JSON：reviewSummaryUrl / reviewDetailUrl / reviewQuoteUrl / detail&reply 规则', kind: 'json' },
   { key: 'ruleExplore', label: 'ruleExplore', tip: '探索规则 JSON：bookList / name / author / kind / coverUrl / intro / bookUrl / wordCount / latestChapterTitle', kind: 'json' },
   { key: 'exploreRule', label: 'exploreRule', tip: '探索规则 JSON（legado 命名别名，与 ruleExplore 二选一）', kind: 'json' },
   { key: 'exploreUrl', label: 'exploreUrl', tip: '探索 URL 模板（每行一个分类地址）', kind: 'text' },

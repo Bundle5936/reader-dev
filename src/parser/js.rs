@@ -2638,6 +2638,11 @@ fn build_bridge_objects(bridge: &JsBridge, context: &mut Context) -> Result<(JsO
             1,
         )
         .function(
+            bind(bridge, java_get_string_list),
+            JsString::from("getStringList"),
+            1,
+        )
+        .function(
             bind(bridge, java_get_elements),
             JsString::from("getElements"),
             1,
@@ -3629,9 +3634,29 @@ fn rule_ends_with_extractor(rule: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// `java.getString(rule)`：对已存文档用 css_chain 规则求值，返回首个结果文本。
-/// 规则末段是 `@text/@href` 等提取器时返回提取值；否则结果是元素 outerHTML，
-/// 转文本（对齐 legado getString 的 getText 语义）；无匹配返回空串。
+/// 规则是否应在 JSON 文档上执行 JSONPath，而不是当作 CSS 选择器。
+/// legado `java.getString/getStringList` 复用 AnalyzeRule，因此段评等 JSON
+/// 书源会直接传入 `$.field`；只支持 CSS 会静默得到空值。
+fn java_rule_is_json(rule: &str) -> bool {
+    let rule = rule.trim();
+    rule.starts_with('$')
+        || rule.starts_with('{')
+        || rule
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("@json:"))
+}
+
+fn java_rule_values(rule: &str, doc: &str) -> Vec<String> {
+    if java_rule_is_json(rule) {
+        crate::parser::rule::apply(rule, doc)
+    } else {
+        crate::parser::css_chain::css_chain(rule, doc)
+    }
+}
+
+/// `java.getString(rule)`：对已存文档用 CSS/JSONPath 规则求值，返回首个结果文本。
+/// 规则末段是属性/文本提取器时返回提取值；否则 CSS 结果转文本（对齐
+/// legado getString 的 getText 语义）；无匹配返回空串。
 fn java_get_string(
     inner: &JsBridgeInner,
     args: &[JsValue],
@@ -3639,30 +3664,42 @@ fn java_get_string(
 ) -> JsResult<JsValue> {
     let rule = js_value_to_string(args.get_or_undefined(0), context);
     let doc = current_doc(inner)?;
-    let results = crate::parser::css_chain::css_chain(&rule, &doc);
+    let results = java_rule_values(&rule, &doc);
     let text = match results.first() {
+        Some(first) if java_rule_is_json(&rule) || rule_ends_with_extractor(&rule) => first.clone(),
         Some(first) => {
-            if rule_ends_with_extractor(&rule) {
-                first.clone()
-            } else {
-                // 元素 HTML → 文本（对齐 search::field 语义）
-                let f = scraper::Html::parse_fragment(first);
-                let t = f
-                    .root_element()
-                    .text()
-                    .collect::<String>()
-                    .trim()
-                    .to_string();
-                if t.is_empty() {
-                    first.clone()
-                } else {
-                    t
-                }
-            }
+            // CSS 元素 HTML → 文本（对齐 search::field 语义）
+            let f = scraper::Html::parse_fragment(first);
+            let t = f
+                .root_element()
+                .text()
+                .collect::<String>()
+                .trim()
+                .to_string();
+            if t.is_empty() { first.clone() } else { t }
         }
         None => String::new(),
     };
     Ok(JsValue::from(JsString::from(text)))
+}
+
+/// `java.getStringList(rule)`：返回 CSS/JSONPath 规则的全部字符串结果。
+/// 对 JSON 数组路径，`apply` 会按 legado getStringList 语义展开数组元素。
+fn java_get_string_list(
+    inner: &JsBridgeInner,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let rule = js_value_to_string(args.get_or_undefined(0), context);
+    let doc = current_doc(inner)?;
+    let values = java_rule_values(&rule, &doc);
+    Ok(JsArray::from_iter(
+        values
+            .into_iter()
+            .map(|value| JsValue::from(JsString::from(value))),
+        context,
+    )
+    .into())
 }
 
 /// `java.getElements(rule)`：对已存文档用 css_chain 规则求值。
@@ -3675,8 +3712,8 @@ fn java_get_elements(
 ) -> JsResult<JsValue> {
     let rule = js_value_to_string(args.get_or_undefined(0), context);
     let doc = current_doc(inner)?;
-    let results = crate::parser::css_chain::css_chain(&rule, &doc);
-    if rule_ends_with_extractor(&rule) {
+    let results = java_rule_values(&rule, &doc);
+    if java_rule_is_json(&rule) || rule_ends_with_extractor(&rule) {
         let arr = JsArray::from_iter(
             results
                 .into_iter()
@@ -7332,6 +7369,40 @@ mod tests {
             )
             .unwrap(),
             ""
+        );
+    }
+
+    #[test]
+    fn bridge_java_json_get_string_and_string_list() {
+        let bridge = JsBridge::new("", "");
+        let v = vars(&[]);
+        let json = serde_json::to_string(&serde_json::json!({
+            "text": "一段评论",
+            "imageUrls": ["https://img.test/a.jpg", "https://img.test/b.png"],
+        }))
+        .unwrap();
+        let js_json = serde_json::to_string(&json).unwrap();
+        assert_eq!(
+            eval_js_with_bridge(
+                &format!(
+                    "java.setContent({js_json}); java.getString('$.text')"
+                ),
+                &v,
+                &bridge,
+            )
+            .unwrap(),
+            "一段评论"
+        );
+        assert_eq!(
+            eval_js_with_bridge(
+                &format!(
+                    "java.setContent({js_json}); JSON.stringify(java.getStringList('$.imageUrls'))"
+                ),
+                &v,
+                &bridge,
+            )
+            .unwrap(),
+            r#"["https://img.test/a.jpg","https://img.test/b.png"]"#
         );
     }
 

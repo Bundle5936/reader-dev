@@ -438,6 +438,7 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
             rule_toc TEXT,
             rule_content TEXT,
             rule_related TEXT,
+            rule_review TEXT,
             search_rule TEXT,
             explore_rule TEXT,
             book_info_rule TEXT,
@@ -712,7 +713,7 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
         ("users", &["token_map", "raw_json"][..]),
         // legacy bookmark.json 的 content 字段无对应列 → raw_json 原文保底
         ("bookmarks", &["raw_json"][..]),
-        ("book_sources", &["rule_related"][..]),
+        ("book_sources", &["rule_related", "rule_review"][..]),
         // GAP 44：旧库缺 rss_source_group 列时补上（新库 CREATE TABLE 已含）
         ("rss_sources", &["rss_source_group"][..]),
         (
@@ -5279,11 +5280,13 @@ where
              concurrent_rate, js_lib, header, proxy_url, login_url, login_ui, login_check_js, login_js,
              book_source_comment, variable_comment, last_update_time, respond_time,
              weight, explore_url, search_url, rule_explore, rule_search, rule_book_info,
-             rule_toc, rule_content, rule_related, search_rule, explore_rule, book_info_rule, toc_rule,
-             content_rule, key, tag, logger, variable, user_namespace, hidden, raw_json)
+             rule_toc, rule_content, rule_related, rule_review, search_rule, explore_rule,
+             book_info_rule, toc_rule, content_rule, key, tag, logger, variable, user_namespace,
+             hidden, raw_json)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)
+                ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42,
+                ?43)
         ON CONFLICT(book_source_url, user_namespace) DO UPDATE SET
             book_source_name = excluded.book_source_name,
             book_source_group = excluded.book_source_group,
@@ -5314,6 +5317,7 @@ where
             rule_toc = excluded.rule_toc,
             rule_content = excluded.rule_content,
             rule_related = excluded.rule_related,
+            rule_review = excluded.rule_review,
             search_rule = excluded.search_rule,
             explore_rule = excluded.explore_rule,
             book_info_rule = excluded.book_info_rule,
@@ -5358,6 +5362,7 @@ where
     .bind(&source.rule_toc)
     .bind(&source.rule_content)
     .bind(&source.rule_related)
+    .bind(&source.rule_review)
     .bind(&source.search_rule)
     .bind(&source.explore_rule)
     .bind(&source.book_info_rule)

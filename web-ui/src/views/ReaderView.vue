@@ -56,7 +56,18 @@ import {
 import { relocateChapterIndex } from '@/utils/progressRelocate'
 import { listProfiles, saveProfile, deleteProfile, applyProfile } from '@/utils/readerConfig'
 import { sanitizeHtml } from '@/utils/sanitize'
-import type { Book, BookChapter, BookInfo, Bookmark, HttpTts, ReplaceRule, SearchBook } from '@/types'
+import type {
+  Book,
+  BookChapter,
+  BookInfo,
+  Bookmark,
+  HttpTts,
+  ReplaceRule,
+  ReviewItem,
+  ReviewPage,
+  ReviewSummary,
+  SearchBook,
+} from '@/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -99,6 +110,28 @@ const chapterIndex = ref(0)
 const content = ref('')
 const loading = ref(true)
 const loadError = ref(false)
+
+/* ---------------- 原生段评（ruleReview：统计、一级评论、回复分页） ---------------- */
+const reviewSummary = ref<ReviewSummary>({ counts: {}, keys: {} })
+let reviewSummaryToken = 0
+const reviewOpen = ref(false)
+const reviewLoading = ref(false)
+const reviewError = ref('')
+const reviewItems = ref<ReviewItem[]>([])
+const reviewPage = ref(1)
+const reviewHasMore = ref(false)
+const reviewParaIndex = ref(0)
+const reviewParaData = ref('')
+let reviewRequestToken = 0
+
+interface ReviewReplyState {
+  items: ReviewItem[]
+  page: number
+  hasMore: boolean
+  loading: boolean
+  error: string
+}
+const reviewReplies = ref<Record<string, ReviewReplyState>>({})
 const notFound = ref(false)
 const drawerOpen = ref(false)
 /** 临时书详情（init 中与目录并行拉取——退出挽留入架时补全作者/封面/目录等字段） */
@@ -2807,6 +2840,7 @@ async function loadContent(chapterUrl: string) {
   loadError.value = false
   content.value = ''
   chapterHtml.value = ''
+  resetReviewSummary()
   // EPUB HTML 模式：不走本机缓存（缓存里可能是纯文本版本），直接带 epubContent=1 重取
   const wantHtml = epubHtmlActive.value
   let text = ''
@@ -2845,6 +2879,7 @@ async function loadContent(chapterUrl: string) {
         }
       }
       content.value = text
+      void loadReviewSummary(chapterUrl)
     }
     // 章节字数：后端 chapterWordCount（本地书正文接口附带）优先；缺失用已缓存正文估算
     chapterWordCounts.value = {
@@ -2890,6 +2925,194 @@ async function loadContent(chapterUrl: string) {
   preloadNextChapterImages()
   // 切章后清除朗读高亮（连播/手动切章后由 startTts 重新跟踪）
   ttsReadingPara.value = -1
+}
+
+function reviewChapterIndex(): number {
+  return currentChapter.value?.index ?? chapterIndex.value
+}
+
+function reviewCountAt(paragraphIndex: number): number {
+  const counts = reviewSummary.value.counts || {}
+  const oneBased = Number(counts[String(paragraphIndex + 1)] ?? 0)
+  if (Number.isFinite(oneBased) && oneBased > 0) return oneBased
+  // 少数旧书源把段落索引写成 0-based；仅在 1-based 未命中时兼容读取。
+  const zeroBased = Number(counts[String(paragraphIndex)] ?? 0)
+  return Number.isFinite(zeroBased) && zeroBased > 0 ? zeroBased : 0
+}
+
+function reviewKeyAt(paragraphIndex: number): string {
+  const keys = reviewSummary.value.keys || {}
+  return keys[String(paragraphIndex + 1)] || keys[String(paragraphIndex)] || paragraphs.value[paragraphIndex] || String(paragraphIndex + 1)
+}
+
+async function loadReviewSummary(chapterUrl: string): Promise<void> {
+  const token = ++reviewSummaryToken
+  reviewSummary.value = { counts: {}, keys: {} }
+  if (!bookUrl.value || !chapterUrl || !isTextBook.value || epubHtmlActive.value || epubRawActive.value) return
+  try {
+    const res = await get<ReviewSummary>('/getReviewSummary', {
+      url: bookUrl.value,
+      bookUrl: bookUrl.value,
+      index: reviewChapterIndex(),
+      chapterUrl,
+      title: currentChapter.value?.title || '',
+    })
+    if (token !== reviewSummaryToken) return
+    if (res.isSuccess && res.data) {
+      reviewSummary.value = {
+        counts: res.data.counts || {},
+        keys: res.data.keys || {},
+      }
+    }
+  } catch {
+    // 没有 ruleReview 或段评接口暂不可用时，正文阅读不受影响。
+  }
+}
+
+function reviewRequestParams(): Record<string, unknown> {
+  const chapter = currentChapter.value
+  return {
+    url: bookUrl.value,
+    bookUrl: bookUrl.value,
+    index: reviewChapterIndex(),
+    chapterUrl: chapter?.url || '',
+    title: chapter?.title || '',
+    paraIndex: reviewParaIndex.value,
+    paraData: reviewParaData.value,
+  }
+}
+
+function reviewItemKey(item: ReviewItem, index: number): string {
+  const id = typeof item.id === 'string' ? item.id.trim() : ''
+  return id || `${item.name || ''}\u0000${item.content || ''}\u0000${item.time || ''}\u0000${index}`
+}
+
+function mergeReviewItems(current: ReviewItem[], incoming: ReviewItem[]): ReviewItem[] {
+  const out = [...current]
+  const seen = new Set(out.map((item, index) => reviewItemKey(item, index)))
+  for (const item of incoming) {
+    const key = reviewItemKey(item, out.length)
+    if (!seen.has(key)) {
+      seen.add(key)
+      out.push(item)
+    }
+  }
+  return out
+}
+
+async function openReview(paragraphIndex: number): Promise<void> {
+  if (reviewCountAt(paragraphIndex) <= 0 || !currentChapter.value) return
+  reviewParaIndex.value = paragraphIndex + 1
+  reviewParaData.value = reviewKeyAt(paragraphIndex)
+  reviewOpen.value = true
+  reviewError.value = ''
+  reviewItems.value = []
+  reviewPage.value = 1
+  reviewHasMore.value = false
+  reviewReplies.value = {}
+  const token = ++reviewRequestToken
+  reviewLoading.value = true
+  try {
+    const res = await get<ReviewPage>('/getReviewDetail', {
+      ...reviewRequestParams(),
+      page: 1,
+    })
+    if (token !== reviewRequestToken) return
+    if (!res.isSuccess || !res.data) throw new Error(res.errorMsg || '段评加载失败')
+    reviewItems.value = mergeReviewItems([], res.data.items || [])
+    reviewHasMore.value = !!res.data.hasMore
+  } catch (error) {
+    if (token === reviewRequestToken) {
+      reviewError.value = error instanceof Error ? error.message : '段评加载失败'
+    }
+  } finally {
+    if (token === reviewRequestToken) reviewLoading.value = false
+  }
+}
+
+function closeReview(): void {
+  reviewRequestToken++
+  reviewOpen.value = false
+  reviewLoading.value = false
+}
+
+async function loadMoreReview(): Promise<void> {
+  if (reviewLoading.value || !reviewHasMore.value) return
+  const page = reviewPage.value + 1
+  const token = reviewRequestToken
+  reviewLoading.value = true
+  try {
+    const res = await get<ReviewPage>('/getReviewDetail', {
+      ...reviewRequestParams(),
+      page,
+    })
+    if (token !== reviewRequestToken) return
+    if (!res.isSuccess || !res.data) throw new Error(res.errorMsg || '段评加载失败')
+    reviewItems.value = mergeReviewItems(reviewItems.value, res.data.items || [])
+    reviewPage.value = page
+    reviewHasMore.value = !!res.data.hasMore
+  } catch (error) {
+    if (token === reviewRequestToken) reviewError.value = error instanceof Error ? error.message : '段评加载失败'
+  } finally {
+    if (token === reviewRequestToken) reviewLoading.value = false
+  }
+}
+
+function replyKey(item: ReviewItem, index: number): string {
+  return (item.id || '').trim() || `reply-${index}`
+}
+
+function replyStateOf(item: ReviewItem, index: number): ReviewReplyState | undefined {
+  return reviewReplies.value[replyKey(item, index)]
+}
+
+async function loadReviewReplies(item: ReviewItem, index: number): Promise<void> {
+  const reviewId = (item.id || '').trim()
+  if (!reviewId) return
+  const key = replyKey(item, index)
+  const old = reviewReplies.value[key]
+  if (old?.loading || old?.hasMore === false && old.items.length > 0) return
+  const page = old ? old.page + 1 : 1
+  reviewReplies.value = {
+    ...reviewReplies.value,
+    [key]: { items: old?.items || [], page: old?.page || 0, hasMore: old?.hasMore ?? true, loading: true, error: '' },
+  }
+  try {
+    const res = await get<ReviewPage>('/getReviewReplies', {
+      ...reviewRequestParams(),
+      reviewId,
+      page,
+    })
+    if (!reviewOpen.value) return
+    if (!res.isSuccess || !res.data) throw new Error(res.errorMsg || '回复加载失败')
+    reviewReplies.value = {
+      ...reviewReplies.value,
+      [key]: {
+        items: mergeReviewItems(old?.items || [], res.data.items || []),
+        page,
+        hasMore: !!res.data.hasMore,
+        loading: false,
+        error: '',
+      },
+    }
+  } catch (error) {
+    reviewReplies.value = {
+      ...reviewReplies.value,
+      [key]: {
+        items: old?.items || [],
+        page: old?.page || 0,
+        hasMore: old?.hasMore ?? true,
+        loading: false,
+        error: error instanceof Error ? error.message : '回复加载失败',
+      },
+    }
+  }
+}
+
+function resetReviewSummary(): void {
+  reviewSummaryToken++
+  reviewSummary.value = { counts: {}, keys: {} }
+  if (reviewOpen.value) closeReview()
 }
 
 function cancelRetention() {
@@ -4223,6 +4446,16 @@ onBeforeUnmount(() => {
                 <span v-if="paraDisplayHtml(i) !== null" v-html="paraDisplayHtml(i)"></span>
                 <template v-else>{{ para }}</template>
               </p>
+              <div v-if="reviewCountAt(i) > 0" class="review-inline">
+                <button
+                  type="button"
+                  class="review-inline-btn"
+                  :title="`查看本段 ${reviewCountAt(i)} 条段评`"
+                  @click.stop="openReview(i)"
+                >
+                  💬 {{ reviewCountAt(i) }} 条段评
+                </button>
+              </div>
             </template>
             </article>
           </div>
@@ -5747,6 +5980,68 @@ onBeforeUnmount(() => {
             </template>
           </div>
         </aside>
+      </div>
+    </transition>
+
+    <!-- 原生段评弹层：一级段评按需加载，回复按条目 page-only 分页 -->
+    <transition name="pop">
+      <div v-if="reviewOpen" class="review-mask" @click.self="closeReview">
+        <section class="review-dialog" @click.stop>
+          <header class="review-head">
+            <div>
+              <strong>段评</strong>
+              <span class="review-head-sub">第 {{ reviewParaIndex }} 段</span>
+            </div>
+            <button type="button" class="review-close" title="关闭" @click="closeReview">×</button>
+          </header>
+          <div class="review-list">
+            <p v-if="reviewLoading && reviewItems.length === 0" class="review-state">段评加载中…</p>
+            <p v-else-if="reviewError && reviewItems.length === 0" class="review-state review-error">{{ reviewError }}</p>
+            <p v-else-if="!reviewLoading && reviewItems.length === 0" class="review-state">暂无段评</p>
+            <article v-for="(item, i) in reviewItems" :key="reviewItemKey(item, i)" class="review-item">
+              <div class="review-meta">
+                <img v-if="item.avatar" class="review-avatar" :src="item.avatar" alt="" loading="lazy" />
+                <span class="review-name">{{ item.name || '匿名读者' }}</span>
+                <span v-for="badge in item.badges" :key="badge" class="review-badge">{{ badge }}</span>
+                <time v-if="item.time" class="review-time">{{ item.time }}</time>
+              </div>
+              <p v-if="item.replyToName" class="review-reply-to">回复 @{{ item.replyToName }}</p>
+              <p v-if="item.content" class="review-content">{{ item.content }}</p>
+              <img v-if="item.imageUrl" class="review-image" :src="item.imageUrl" alt="段评配图" loading="lazy" />
+              <a v-if="item.audioUrl" class="review-audio" :href="item.audioUrl" target="_blank" rel="noopener noreferrer">播放段评语音</a>
+              <div class="review-item-foot">
+                <span v-if="typeof item.likeCount === 'number'">赞 {{ item.likeCount }}</span>
+                <span v-if="typeof item.replyCount === 'number'">{{ item.replyCount }} 条回复</span>
+                <button
+                  v-if="(item.replyCount || 0) > 0 || item.id"
+                  type="button"
+                  class="review-reply-btn"
+                  :disabled="replyStateOf(item, i)?.loading"
+                  @click="loadReviewReplies(item, i)"
+                >
+                  {{ replyStateOf(item, i)?.loading ? '加载中…' : replyStateOf(item, i)?.hasMore === false ? '已加载完回复' : replyStateOf(item, i) ? '加载下一页回复' : '更多回复' }}
+                </button>
+              </div>
+              <div v-if="item.replies.length || replyStateOf(item, i)?.items.length" class="review-replies">
+                <div v-for="(reply, ri) in item.replies" :key="`nested-${reviewItemKey(reply, ri)}`" class="review-reply">
+                  <b>{{ reply.name || '匿名读者' }}</b><span v-if="reply.replyToName"> 回复 @{{ reply.replyToName }}</span>：{{ reply.content }}
+                </div>
+                <div v-for="(reply, ri) in replyStateOf(item, i)?.items || []" :key="`page-${reviewItemKey(reply, ri)}`" class="review-reply">
+                  <b>{{ reply.name || '匿名读者' }}</b><span v-if="reply.replyToName"> 回复 @{{ reply.replyToName }}</span>：{{ reply.content }}
+                  <img v-if="reply.imageUrl" class="review-reply-image" :src="reply.imageUrl" alt="回复配图" loading="lazy" />
+                </div>
+                <p v-if="replyStateOf(item, i)?.error" class="review-reply-error">{{ replyStateOf(item, i)?.error }}</p>
+              </div>
+            </article>
+          </div>
+          <footer class="review-foot">
+            <span v-if="reviewError && reviewItems.length" class="review-error">{{ reviewError }}</span>
+            <button v-if="reviewHasMore" type="button" class="review-more-btn" :disabled="reviewLoading" @click="loadMoreReview">
+              {{ reviewLoading ? '加载中…' : '加载下一页段评' }}
+            </button>
+            <button type="button" class="text-btn" @click="closeReview">关闭</button>
+          </footer>
+        </section>
       </div>
     </transition>
 
@@ -7390,6 +7685,207 @@ onBeforeUnmount(() => {
 }
 .text-btn.danger:hover {
   color: #cf4444;
+}
+
+/* ================= 原生段评 ================= */
+.review-inline {
+  display: flex;
+  justify-content: flex-end;
+  margin: -0.35em 0 0.8em;
+}
+.review-inline-btn {
+  border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--border));
+  border-radius: 999px;
+  padding: 3px 10px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.review-inline-btn:hover {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.review-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(24, 24, 27, 0.34);
+}
+.review-dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(760px, 100%);
+  max-height: min(82vh, 820px);
+  overflow: hidden;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 18px 18px 10px 10px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.22);
+}
+.review-head,
+.review-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-shrink: 0;
+  padding: 13px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.review-foot {
+  justify-content: flex-end;
+  border-top: 1px solid var(--border);
+  border-bottom: 0;
+}
+.review-head-sub {
+  margin-left: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+.review-close {
+  width: 30px;
+  height: 30px;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+}
+.review-list {
+  min-height: 120px;
+  overflow: auto;
+  padding: 6px 18px 12px;
+}
+.review-state {
+  padding: 32px 8px;
+  color: var(--muted);
+  text-align: center;
+}
+.review-error,
+.review-reply-error {
+  color: #cf4444;
+  font-size: 12px;
+}
+.review-item {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+.review-item:last-child {
+  border-bottom: 0;
+}
+.review-meta {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.review-avatar {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--bg);
+}
+.review-name {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.review-badge {
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  font-size: 10px;
+}
+.review-time {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+.review-reply-to {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.review-content {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.review-image {
+  display: block;
+  max-width: min(100%, 360px);
+  max-height: 300px;
+  margin-top: 9px;
+  border-radius: 8px;
+  object-fit: contain;
+}
+.review-audio {
+  display: inline-block;
+  margin-top: 8px;
+  color: var(--accent);
+  font-size: 12px;
+}
+.review-item-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 9px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.review-reply-btn,
+.review-more-btn {
+  margin-left: auto;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--accent);
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.review-reply-btn:disabled,
+.review-more-btn:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+.review-replies {
+  margin: 10px 0 0 35px;
+  padding-left: 11px;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+}
+.review-reply {
+  padding: 5px 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.review-reply b {
+  color: var(--text);
+}
+.review-reply-image {
+  display: block;
+  max-width: 220px;
+  max-height: 180px;
+  margin-top: 5px;
+  border-radius: 6px;
 }
 
 /* ================= 章节侧栏 ================= */

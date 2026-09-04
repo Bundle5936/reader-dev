@@ -22,6 +22,7 @@ Rust + Vue 3 实现，legado 语义书源规则引擎。当前主线发布 **v5.
 - **JS 能力**：`java.get/put/post/ajax/getCookie/timeFormat/timeFormatUTC`、`cookie.getCookie/getKey/setCookie/replaceCookie/removeCookie/clearCookie`、全局 `gzip`（GZip→base64）、AES、`getWbiEnc`、`Reload` 等
 - **书源管理**：增删改、启停、分组、失效检测、本地/远程导入导出（导入前预览勾选、排序——全选/反选/仅新增/重复标记）、订阅源（订阅即自动刷新记录，删除订阅即停止刷新）、登录流（`loginUrl` + 验证码）、手动 Cookie；普通用户删除/停用系统书源只对本人生成私有覆盖；管理员默认使用本人账号，可手动进入 `default` 系统配置层编辑对所有用户生效的公用数据
 - **书源调试**：搜索/目录/正文逐规则逐步日志（SSE 流式）
+- **原生段评（只读）**：保存并执行 legado `ruleReview`，支持段评统计、一级段评、配图/表情/徽章、楼中楼“更多回复”和 1-based `page` 分页；请求沿用统一 SSRF 防护，服务端不提供点赞/发布/删除
 - **换源**：阅读中直接换源，弹层展示书源作者、最新章节、当前章各源末尾预览（宽度自适应截断）；并发多源搜索 + 书名过滤去重 + 书源名过滤 + 手动刷新，切换保留当前章进度
 
 ### 反检测（进程内——obscura）
@@ -72,6 +73,7 @@ EPUB · TXT · MOBI · AZW3 · PDF · FB2 · DOCX · CBZ（漫画）· UMD —�
 
 - argon2id 密码哈希（PHC——登录自动升级）、token 随机化（uuid v4、多设备上限 5）、登录限流（直连 IP）
 - 命名空间隔离、路径穿越防护、SSRF 防护、图片缓存按用户隔离、SQL 全参数化
+- 私有书源白名单：默认仍拒绝所有私网地址；仅在明确需要时设置 `READER_SSRF_ALLOW_PRIVATE_HOSTS=host[:port],...`，精确允许指定源地址（同时约束重定向和图片代理）
 - secure 多用户：首个注册用户自动成为管理员；管理员默认使用本人账号（个人书架/书源/进度等），从顶栏「用户」入口管理账号，并可手动进入 default 系统配置层（编辑公用书源等）；普通用户覆盖系统配置只对自己生效，最后一名管理员不可撤销/删除
 - 注册默认权限全开（WebDAV/本地书仓/书源/RSS），书源上限 80000、书籍上限 5000；旧库启动时一次性纠正仍等于旧错误默认值的用户，人工改过的不动
 - 服务监控页（内存/CPU/请求/在线/书源成功率）、日志
@@ -197,6 +199,7 @@ READER_APP_WORKDIR=/storage READER_APP_SECURE=true ./reader-dev-linux-x64-musl
 | `READER_LOCAL_BOOK_DIR` | 空 | 本地书监听目录 |
 | `READER_DIR_SCAN_RPS` | `20` | 目录扫描每秒文件系统操作上限（0 不限速，最大 500） |
 | `READER_LOG_DIR` | 空 | 日志目录（按大小轮转） |
+| `READER_SSRF_ALLOW_PRIVATE_HOSTS` | 空 | 可信内网书源例外，精确匹配 `host[:port]`，例如 `10.0.0.4:7822`；不建议全局放行 |
 
 ---
 

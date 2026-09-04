@@ -352,39 +352,11 @@ pub(crate) fn build_request_url(
 ) -> Result<(String, UrlSuffix)> {
     // 0) legacy replaceKeyPageJs：展开全部 {{js}} 表达式
     let expanded = expand_url_js_templates(search_url, key, page, base_url, headers, bridge);
-    // 1) `<js>…</js>` 包裹（legado JS_PATTERN：URL 可整体为 JS 规则；`</js>` 后的
-    //    `,{...}` 后缀保留待 2) 解析）
+    // 1) legado AppPattern.JS_PATTERN 不要求 JS 标记位于字符串开头：
+    //    `https://host/search\\n@js:...` 与 `https://host/search@js:...` 都是合法书源。
+    //    旧实现只识别开头的 @js，导致 @js 代码被拼进请求 URL（服务端通常返回 0 条）。
     let raw = expanded.trim_start();
-    let url = if let Some((prefix, code, tail)) = wrapped_js_parts(raw) {
-        let vars = js_vars(key, page, base_url, headers, "");
-        let mut result = crate::parser::js::eval_js_with_bridge(&code, &vars, bridge)?;
-        // 前缀/后缀通过 `@result` 拼接（legado analyzeJs 语义；无 @result 时前后文本
-        // 直接拼回结果——书源通常整体为 JS，此分支兼容 `<js>…</js>,{...}` 等拼接形态）
-        if !prefix.trim().is_empty() {
-            result = if prefix.contains("@result") {
-                prefix.replace("@result", &result)
-            } else {
-                format!("{prefix}{result}")
-            };
-        }
-        if !tail.trim().is_empty() {
-            result = if tail.contains("@result") {
-                tail.replace("@result", &result)
-            } else {
-                format!("{result}{tail}")
-            };
-        }
-        result
-    } else {
-        match raw.strip_prefix("@js:").or_else(|| raw.strip_prefix("js:")) {
-            Some(code) => {
-                let vars = js_vars(key, page, base_url, headers, "");
-                crate::parser::js::eval_js_with_bridge(code.trim(), &vars, bridge)?
-            }
-            // 非 JS 规则 → 使用展开后的 URL（保留 0) 步的 {{js}} 展开成果）
-            None => raw.to_string(),
-        }
-    };
+    let url = eval_search_url_js(raw, key, page, base_url, headers, bridge)?;
     // 2) `,{...}` 后缀
     let (url_part, mut suffix) = split_url_suffix(&url);
     let url = match suffix.js.take() {
@@ -398,18 +370,78 @@ pub(crate) fn build_request_url(
     Ok((build_search_url(&url, key, page, base_url), suffix))
 }
 
-/// 切分 `<js>…</js>` 包裹规则：返回 (前缀, JS 代码, `</js>` 后剩余文本)
-fn wrapped_js_parts(rule: &str) -> Option<(String, String, String)> {
-    let r = rule.trim_start();
-    let start = r.find("<js>")?;
-    let code_start = start + 4;
-    let rest = &r[code_start..];
-    let code_end = rest.find("</js>")?;
-    Some((
-        r[..start].to_string(),
-        rest[..code_end].to_string(),
-        rest[code_end + "</js>".len()..].to_string(),
-    ))
+/// 执行搜索 URL 中任意位置的 `<js>…</js>` / `@js:`。
+///
+/// `AnalyzeUrl.analyzeJs` 会把标记前的 URL 作为 `result` 传给 JS；这正是
+/// native 番茄书源用来在 `result` 上追加搜索状态参数的写法。`@js:` 规则按
+/// legado 语义贪婪到字符串末尾；`<js>` 后的普通文本保留为 URL 后缀（例如
+/// `,{"method":"POST"}`）。
+fn eval_search_url_js(
+    raw: &str,
+    key: &str,
+    page: i64,
+    base_url: &str,
+    headers: &HashMap<String, String>,
+    bridge: &JsBridge,
+) -> Result<String> {
+    let lower = raw.to_ascii_lowercase();
+    let at_pos = lower.find("@js:");
+    let tag_pos = lower.find("<js>").and_then(|start| {
+        lower[start + 4..]
+            .find("</js>")
+            .map(|rel| (start, start + 4, start + 4 + rel))
+    });
+
+    // 纯 `js:` 前缀是历史兼容写法；`@js:` 已由下面的通用分支处理。
+    if at_pos.is_none() && tag_pos.is_none() {
+        if lower.starts_with("js:") {
+            let vars = js_vars(key, page, base_url, headers, raw);
+            return crate::parser::js::eval_js_with_bridge(raw[3..].trim(), &vars, bridge);
+        }
+        return Ok(raw.to_string());
+    }
+
+    // `<js>` 与 `@js:` 同时存在时按它们在规则中的先后处理；@js 代码按 legado
+    // 的贪婪规则吃掉剩余字符串，因此它一旦先出现就直接作为最后一段。
+    if let Some(at) = at_pos {
+        if tag_pos.is_none_or(|(tag, _, _)| at < tag) {
+            let prefix = raw[..at].trim();
+            let current = if prefix.is_empty() {
+                raw.to_string()
+            } else {
+                prefix.to_string()
+            };
+            let vars = js_vars(key, page, base_url, headers, &current);
+            return crate::parser::js::eval_js_with_bridge(raw[at + 4..].trim(), &vars, bridge);
+        }
+    }
+
+    let Some((tag, code_start, code_end)) = tag_pos else {
+        return Ok(raw.to_string());
+    };
+    let prefix = raw[..tag].trim();
+    let vars = js_vars(
+        key,
+        page,
+        base_url,
+        headers,
+        if prefix.is_empty() { raw } else { prefix },
+    );
+    let mut result = crate::parser::js::eval_js_with_bridge(
+        &raw[code_start..code_end],
+        &vars,
+        bridge,
+    )?;
+    let tail = raw[code_end + 5..].trim();
+    if !tail.is_empty() {
+        result = if tail.contains("@result") {
+            tail.replace("@result", &result)
+        } else {
+            // 保留 `<js>…</js>,{...}` 等 URL option 后缀。
+            format!("{result}{tail}")
+        };
+    }
+    Ok(result)
 }
 
 /// data URI 前缀检测（`data:;base64,` / `data:text/plain;base64,` 等）
@@ -2144,6 +2176,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(url, "https://a.com/s?q=测试书&p=2");
+        assert!(suffix.js.is_none() && suffix.body_js.is_none());
+    }
+
+    #[test]
+    fn test_js_search_url_after_literal_url() {
+        // legado JS_PATTERN：@js: 可以位于 URL 后，result 是标记前的 URL。
+        let headers = HashMap::new();
+        let (url, suffix) = build_request_url(
+            "https://a.com/search?q={{key}}&page={{page}}\\n@js:result + '&state=' + page",
+            "测试书",
+            2,
+            "https://a.com",
+            &headers,
+            &JsBridge::default(),
+        )
+        .unwrap();
+        assert_eq!(url, "https://a.com/search?q=测试书&page=2&state=2");
         assert!(suffix.js.is_none() && suffix.body_js.is_none());
     }
 

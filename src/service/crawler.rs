@@ -626,9 +626,48 @@ pub async fn fetch_image(
 
 // ==================== SSRF 防护（/assets/proxy 回源目标校验，M1） ====================
 
-/// 测试钩子：允许私网/回环回源目标（仅测试代码设置；生产恒为 false）。
-/// 生产代码不读环境变量、无配置入口——所有请求强制校验。
+/// 测试钩子：临时允许私网/回环回源目标（仅测试代码设置；生产不会打开全局放行）。
 pub static SSRF_ALLOW_PRIVATE: AtomicBool = AtomicBool::new(false);
+
+/// 生产环境按精确主机（可带端口）放行私有回源目标。
+///
+/// 这是给可信的内网书源使用的窄范围例外，不是全局关闭 SSRF：
+/// `READER_SSRF_ALLOW_PRIVATE_HOSTS=10.0.0.4:7822,fanqie-api:7822`。
+/// 未配置时保持所有私网/回环/链路本地目标均拒绝。
+fn private_target_allowlisted(parsed: &url::Url) -> bool {
+    let Some(target_host) = parsed.host_str() else {
+        return false;
+    };
+    let target_port = parsed.port_or_known_default();
+    let Ok(entries) = std::env::var("READER_SSRF_ALLOW_PRIVATE_HOSTS") else {
+        return false;
+    };
+
+    entries.split(',').any(|entry| {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return false;
+        }
+        // 将 `host[:port]` 规范化为 URL，兼容域名、IPv4 及 `[IPv6]:port`。
+        let entry_url = if entry.contains("://") {
+            entry.to_string()
+        } else {
+            format!("http://{entry}")
+        };
+        let Ok(entry_url) = url::Url::parse(&entry_url) else {
+            return false;
+        };
+        let Some(entry_host) = entry_url.host_str() else {
+            return false;
+        };
+        if !entry_host.eq_ignore_ascii_case(target_host) {
+            return false;
+        }
+        entry_url
+            .port()
+            .is_none_or(|entry_port| Some(entry_port) == target_port)
+    })
+}
 
 /// 测试互斥锁：所有读写 `SSRF_ALLOW_PRIVATE` 的测试持同一把锁（串行），
 /// 避免并行测试互相干扰（放行态与拦截态断言互斥）。
@@ -688,12 +727,15 @@ pub fn is_private_target_ip(ip: std::net::IpAddr) -> bool {
 /// 重定向跳转目标校验（同步版——reqwest redirect `Policy::custom` 闭包内调用；
 /// 语义与 [`validate_public_target`] 一致：字面 IP 直接判定、域名解析后逐个 IP 校验、
 /// 私网/回环/链路本地/未指定/广播一律拒绝、解析失败拒绝；测试钩子
-/// `SSRF_ALLOW_PRIVATE` 放行态同样生效）。
+/// `SSRF_ALLOW_PRIVATE` 或生产精确主机白名单放行态同样生效）。
 pub fn validate_redirect_target(url: &str) -> Result<()> {
     if SSRF_ALLOW_PRIVATE.load(Ordering::Relaxed) {
         return Ok(());
     }
     let parsed = url::Url::parse(url).map_err(|e| anyhow!("重定向目标 URL 非法: {e}"))?;
+    if private_target_allowlisted(&parsed) {
+        return Ok(());
+    }
     // 字面 IP 快速路径（不经 DNS——Host::Ipv6 直接判回环，不依赖系统 IPv6 支持）
     match parsed.host() {
         Some(url::Host::Ipv4(ip)) => {
@@ -740,12 +782,16 @@ pub fn validate_redirect_target(url: &str) -> Result<()> {
 /// - 字面 IP：直接判定（回环/私网/链路本地/未指定/广播一律拒绝）；
 /// - 域名：DNS 解析后逐个 IP 校验（任一解析到私网即拒绝）；localhost 直接拒绝；
 /// - 解析失败 / 无地址 → 拒绝。
-/// 供 fetch_image 每跳调用（含重定向目标）——/assets/proxy 非 secure 模式同样生效。
+/// 供 fetch_image 每跳调用（含重定向目标）——/assets/proxy 非 secure 模式同样生效；
+/// 私有目标只有在 `READER_SSRF_ALLOW_PRIVATE_HOSTS` 精确匹配时才放行。
 pub async fn validate_public_target(url: &str) -> Result<()> {
     if SSRF_ALLOW_PRIVATE.load(Ordering::Relaxed) {
         return Ok(());
     }
     let parsed = url::Url::parse(url).map_err(|e| anyhow!("目标 URL 非法: {e}"))?;
+    if private_target_allowlisted(&parsed) {
+        return Ok(());
+    }
     // 字面 IP 快速路径（不经 DNS——Host::Ipv6 直接判回环，不依赖系统 IPv6 支持）
     match parsed.host() {
         Some(url::Host::Ipv4(ip)) => {
@@ -2585,6 +2631,24 @@ mod tests {
                 "{label}（{url}）应被拦截: {err}"
             );
         }
+    }
+
+    /// 可信内网书源：只放行配置的精确主机/端口，不放大全局私网访问。
+    #[tokio::test]
+    async fn test_ssrf_allows_configured_private_host_only() {
+        let _g = ssrf_allow_private_guard(false);
+        std::env::set_var("READER_SSRF_ALLOW_PRIVATE_HOSTS", "10.0.0.4:7822");
+        validate_public_target("http://10.0.0.4:7822/source-native")
+            .await
+            .expect("配置的内网书源应放行");
+        validate_public_target("http://10.0.0.4:7823/source-native")
+            .await
+            .expect_err("未配置的端口仍应拦截");
+        validate_redirect_target("http://10.0.0.4:7822/redirect")
+            .expect("配置的内网重定向目标应放行");
+        validate_redirect_target("http://10.0.0.5:7822/redirect")
+            .expect_err("未配置的内网主机仍应拦截");
+        std::env::remove_var("READER_SSRF_ALLOW_PRIVATE_HOSTS");
     }
 
     /// M1 SSRF：公网地址放行——字面公网 IP 与公网域名（DNS 解析后校验）

@@ -300,6 +300,10 @@ pub fn analyze_book_info(
     // @put/@get 变量随本书流程贯通（legado Book.putVariable）——详情→目录共享
     let mut vars = crate::parser::rule::load_book_vars(ns, &source.book_source_url, book_url);
     vars.book_name = book_name.map(str::to_string);
+    // 详情 URL 的最后路径段作为通用 book_id 变量，供目录 URL 规则复用。
+    // 原生书源常用 `java.get('book_id')`；目录阶段会继续从这里读取，
+    // 避免把同一段 ID 的提取放进每个章节的 JS 求值。
+    seed_book_id_vars(&mut vars, book_url, base_url);
     // E10/AR5：详情页真实 URL → JS 求值绑定 baseUrl（搜索场景无章节上下文）
     vars.insert("baseUrl".to_string(), base_url.to_string());
     let html = crate::parser::rule::apply_init_with_vars(html, rule.init.as_deref(), &mut vars);
@@ -563,6 +567,10 @@ async fn analyze_toc_impl(
     let mut vars =
         crate::parser::rule::load_book_vars_merged(ns, &source.book_source_url, book_url, toc_url);
     vars.book_name = book_name.map(str::to_string);
+    // 书源目录 URL 常需复用详情阶段得到的书籍 ID。把可从书/目录 URL
+    // 无歧义取得的末段预置为普通 @get 变量，避免每个章节都启动一次 JS
+    // 解析器（大型目录可能有数千章）。书源不使用这些键时不会改变原有语义。
+    seed_book_id_vars(&mut vars, book_url, toc_url);
 
     for _page in 0..max_pages {
         let resp = fetch_url(ns, &current_url, source).await?;
@@ -598,9 +606,14 @@ async fn analyze_toc_impl(
         let items = toc_items(&list_rule, &page_html);
         let start_index = all.len() as i64;
         let chapters = chapters_from_items(&items, &rule, &base, start_index, &mut vars);
-        for ch in &chapters {
-            // 正文流程只带章节 URL——按章节 URL 再存一份，保证 getBookContent 命中
-            crate::parser::rule::save_book_vars(ns, &source.book_source_url, &ch.url, &vars);
+        // 只有目录规则确实产生了 @put 变量时才逐章落库。`result/src/baseUrl`
+        // 等运行时上下文不应持久化；native 番茄源只额外有自动预置的 book_id，
+        // 逐章写 1496 次 SQLite 会把首个目录请求拖到几十秒。
+        if should_persist_toc_chapter_vars(&vars) {
+            for ch in &chapters {
+                // 正文流程只带章节 URL——按章节 URL 再存一份，保证 getBookContent 命中
+                crate::parser::rule::save_book_vars(ns, &source.book_source_url, &ch.url, &vars);
+            }
         }
         all.extend(chapters);
 
@@ -645,6 +658,52 @@ async fn analyze_toc_impl(
     Ok(all)
 }
 
+/// 目录阶段是否需要把变量复制到每个章节键。
+/// 运行时上下文和自动从书 URL 推导的 ID 都能在后续请求中重建；只有真正
+/// 由书源 `@put` 产生的其他变量才需要逐章落库。
+fn should_persist_toc_chapter_vars(vars: &crate::parser::rule::RuleVars) -> bool {
+    vars.iter().any(|(key, _)| {
+        !matches!(
+            key.as_str(),
+            "book_id" | "bookId" | "result" | "src" | "baseUrl" | "key" | "page"
+        )
+    })
+}
+
+/// 从书籍/目录 URL 的最后一个路径段预置 `book_id`/`bookId`。
+///
+/// 这是普通规则变量，不是 provider 专用字段：书源可用 `@get:{book_id}`
+/// 在章节 URL 中复用详情阶段的 ID，从而保持 URL 规则为纯模板/JSONPath，
+/// 避免对每个目录项重复执行昂贵的 JS 上下文初始化。
+fn seed_book_id_vars(vars: &mut crate::parser::rule::RuleVars, book_url: &str, toc_url: &str) {
+    if vars.contains_key("book_id") {
+        return;
+    }
+    if let Some(book_id) = vars.get("bookId").cloned() {
+        vars.insert("book_id".to_string(), book_id);
+        return;
+    }
+    for candidate in [book_url, toc_url] {
+        let Some(id) = candidate
+            .split_once('?')
+            .map(|(path, _)| path)
+            .unwrap_or(candidate)
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|v| !v.is_empty())
+        else {
+            continue;
+        };
+        if id == candidate || id.contains(':') {
+            continue;
+        }
+        vars.insert("book_id".to_string(), id.to_string());
+        vars.insert("bookId".to_string(), id.to_string());
+        break;
+    }
+}
+
 /// 单页目录解析（ruleToc 应用一次——getChapterListByRule 调试接口复用）
 pub async fn parse_toc_page(
     ns: &str,
@@ -660,6 +719,7 @@ pub async fn parse_toc_page(
     let mut vars =
         crate::parser::rule::load_book_vars_merged(ns, &source.book_source_url, book_url, url);
     vars.book_name = book_name.map(str::to_string);
+    seed_book_id_vars(&mut vars, book_url, url);
     // E10/AR5：真实页 URL → JS 求值绑定 baseUrl
     vars.insert("baseUrl".to_string(), base.clone());
     let rule: TocRule = source
@@ -681,8 +741,10 @@ pub async fn parse_toc_page(
     }
     let items = toc_items(&list_rule, &page_html);
     let chapters = chapters_from_items(&items, &rule, &base, 0, &mut vars);
-    for ch in &chapters {
-        crate::parser::rule::save_book_vars(ns, &source.book_source_url, &ch.url, &vars);
+    if should_persist_toc_chapter_vars(&vars) {
+        for ch in &chapters {
+            crate::parser::rule::save_book_vars(ns, &source.book_source_url, &ch.url, &vars);
+        }
     }
     crate::parser::rule::save_book_vars_two_level(
         ns,
@@ -753,6 +815,138 @@ fn js_chapter_items(rule: &str, body: &str) -> Vec<String> {
     }
 }
 
+/// 目录更新时间常见写法是 `$.updateTime<js>java.timeFormat(...)`。
+/// 当前目录 API 的更新时间已经是可展示的源字段；先取前缀可避免为每章
+/// 重建 JS Context。其他 JS 更新时间规则继续走完整引擎，保持原有语义。
+fn fast_toc_time_rule_value(
+    item: Option<&serde_json::Value>,
+    rule: Option<&str>,
+    vars: &crate::parser::rule::RuleVars,
+) -> Option<String> {
+    let rule = rule?.trim();
+    if !rule.to_ascii_lowercase().contains("timeformat") {
+        return None;
+    }
+    let prefix = rule.split_once("<js>")?.0.trim();
+    fast_toc_rule_value(item, Some(prefix), vars)
+}
+
+/// 轻量目录字段求值：只处理 JSONPath 标量和由 JSONPath 模板组成的文本。
+/// 含 JS/CSS/Regex/替换链等复杂语法返回 `None`，由完整规则引擎接管。
+fn fast_toc_rule_value(
+    item: Option<&serde_json::Value>,
+    rule: Option<&str>,
+    vars: &crate::parser::rule::RuleVars,
+) -> Option<String> {
+    let rule = rule?.trim();
+    if rule.is_empty()
+        || rule.contains("<js>")
+        || rule.contains("@js:")
+        || rule.contains("@put:")
+        || rule.contains("##")
+        || rule.contains("&&")
+        || rule.contains("||")
+        || rule.contains("%%")
+    {
+        return None;
+    }
+    let resolved = crate::parser::rule::resolve_get(rule, vars);
+    if resolved.starts_with("$") {
+        return fast_toc_json_path(item?, &resolved);
+    }
+    if !resolved.contains("{{") {
+        return (resolved.starts_with('/')
+            || resolved.starts_with("http://")
+            || resolved.starts_with("https://"))
+        .then_some(resolved);
+    }
+    let item = item?;
+    let mut out = String::with_capacity(resolved.len());
+    let mut rest = resolved.as_str();
+    loop {
+        let Some(start) = rest.find("{{") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after.find("}}")?;
+        let expr = after[..end].trim();
+        if expr.starts_with("$.") || expr.starts_with("$") {
+            out.push_str(&fast_toc_json_path(item, expr)?);
+        } else if let Some(key) = fast_toc_java_get_key(expr) {
+            out.push_str(vars.get(key)?);
+        } else {
+            return None;
+        }
+        rest = &after[end + 2..];
+    }
+    Some(out)
+}
+
+/// 目录快速路径只接受单段/数组下标 JSONPath；过滤、递归等复杂路径交给完整引擎。
+fn fast_toc_java_get_key(expr: &str) -> Option<&str> {
+    let expr = expr.trim();
+    let rest = expr.strip_prefix("java.get(")?.strip_suffix(')')?.trim();
+    let rest = rest
+        .strip_prefix('\'')
+        .and_then(|v| v.strip_suffix('\''))
+        .or_else(|| rest.strip_prefix('"').and_then(|v| v.strip_suffix('"')))?;
+    (!rest.is_empty()).then_some(rest)
+}
+
+fn fast_toc_json_path(item: &serde_json::Value, path: &str) -> Option<String> {
+    let path = path.trim();
+    if !(path.starts_with("$.") || path.starts_with("$["))
+        || path.contains("..")
+        || path.contains("?")
+        || path.contains("*")
+        || path.contains(":")
+    {
+        return None;
+    }
+    let mut current = item;
+    let mut rest = path.strip_prefix('$')?;
+    while !rest.is_empty() {
+        if let Some(key) = rest.strip_prefix('.') {
+            let end = key
+                .find(|c: char| c == '.' || c == '[')
+                .unwrap_or(key.len());
+            if end == 0 {
+                return None;
+            }
+            current = current.get(&key[..end])?;
+            rest = &key[end..];
+        } else if let Some(index_text) = rest.strip_prefix('[') {
+            let end = index_text.find(']')?;
+            let index = index_text[..end].trim().parse::<usize>().ok()?;
+            current = current.get(index)?;
+            rest = &index_text[end + 1..];
+        } else {
+            return None;
+        }
+    }
+    match current {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Array(values) => Some(
+            values
+                .iter()
+                .filter_map(|value| match value {
+                    serde_json::Value::String(value) => Some(value.clone()),
+                    serde_json::Value::Number(value) => Some(value.to_string()),
+                    serde_json::Value::Bool(value) => Some(value.to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        serde_json::Value::Object(value) => serde_json::to_string(value).ok(),
+        serde_json::Value::Null => None,
+    }
+}
+
 /// 章节上下文列表 → 章节（字段规则应用 + 相对 URL 转绝对）
 fn chapters_from_items(
     items: &[String],
@@ -765,16 +959,51 @@ fn chapters_from_items(
         .iter()
         .enumerate()
         .filter_map(|(i, item)| {
-            let title = crate::service::search::field_with_vars(
-                item,
+            // 大型 JSON 目录中的每个字段若都重新走完整规则引擎，会重复解析同一
+            // JSON；若 URL 还含 JS，则会为每章创建 Boa Context。对最常见的纯
+            // JSONPath/模板规则先走一次 serde_json，复杂规则仍完整回退。
+            let item_json = serde_json::from_str::<serde_json::Value>(item).ok();
+            let title = fast_toc_rule_value(
+                item_json.as_ref(),
                 rule.chapter_name.as_deref(),
-                "",
                 vars,
-            );
+            )
+            .unwrap_or_else(|| {
+                crate::service::search::field_with_vars(
+                    item,
+                    rule.chapter_name.as_deref(),
+                    "",
+                    vars,
+                )
+            });
             let url = match &rule.chapter_url {
-                Some(r) => {
-                    crate::service::search::field_url_with_vars(item, Some(r), "", base, vars)
-                }
+                Some(r) => fast_toc_rule_value(item_json.as_ref(), Some(r), vars)
+                    .filter(|v| !v.is_empty())
+                    .map(|v| {
+                        if v.starts_with('/')
+                            || v.starts_with("http://")
+                            || v.starts_with("https://")
+                        {
+                            crate::service::search::to_absolute(&v, base)
+                        } else {
+                            crate::service::search::field_url_with_vars(
+                                item,
+                                Some(r),
+                                "",
+                                base,
+                                vars,
+                            )
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        crate::service::search::field_url_with_vars(
+                            item,
+                            Some(r),
+                            "",
+                            base,
+                            vars,
+                        )
+                    }),
                 None => String::new(),
             };
             if title.is_empty() && url.is_empty() {
@@ -807,11 +1036,21 @@ fn chapters_from_items(
                 }
             }
             // legacy BookChapter.tag：目录规则 updateTime 的解析结果
-            let tag = crate::service::search::opt_field_with_vars(
-                item,
+            let tag = fast_toc_time_rule_value(
+                item_json.as_ref(),
                 rule.update_time.as_deref(),
                 vars,
             )
+            .or_else(|| {
+                fast_toc_rule_value(item_json.as_ref(), rule.update_time.as_deref(), vars)
+            })
+            .or_else(|| {
+                crate::service::search::opt_field_with_vars(
+                    item,
+                    rule.update_time.as_deref(),
+                    vars,
+                )
+            })
             .filter(|s| !s.trim().is_empty());
             Some(BookChapter {
                 title,
@@ -1687,6 +1926,39 @@ mod tests {
             })),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn fast_toc_rules_resolve_native_urls_without_js_per_chapter() {
+        let item = serde_json::json!({
+            "item_id": "7173216089122439711",
+            "title": "第1章 空屋",
+            "updateTime": 1670144602,
+        });
+        let mut vars = crate::parser::rule::RuleVars::new();
+        vars.insert("book_id".into(), "7143038691944959011".into());
+        assert_eq!(
+            fast_toc_rule_value(Some(&item), Some("$.title"), &vars).as_deref(),
+            Some("第1章 空屋")
+        );
+        assert_eq!(
+            fast_toc_rule_value(
+                Some(&item),
+                Some("/chapter/{{java.get('book_id')}}/{{$.item_id}}"),
+                &vars,
+            )
+            .as_deref(),
+            Some("/chapter/7143038691944959011/7173216089122439711")
+        );
+        assert_eq!(
+            fast_toc_rule_value(
+                Some(&item),
+                Some("/chapter/@get:{book_id}/{{$.item_id}}"),
+                &vars,
+            )
+            .as_deref(),
+            Some("/chapter/7143038691944959011/7173216089122439711")
+        );
     }
 
     #[test]

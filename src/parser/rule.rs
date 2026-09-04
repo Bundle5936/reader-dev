@@ -306,12 +306,20 @@ pub fn save_book_vars_two_level(
 }
 
 /// 保存书级变量（LRU 上限 + 单书条目/字节上限，超限静默丢弃——与 source.put 上限语义一致；
-/// 内存 + SQLite 双写）。P0 按命名空间隔离
+/// 内存 + SQLite 双写）。P0 按命名空间隔离。
+///
+/// `result`、`src`、`baseUrl`、`key`、`page` 是一次规则求值的上下文，不是
+/// `@put` 变量。目录解析时它们可能分别包含整份响应正文、当前 URL 或分页值；
+/// 若随每个章节持久化，会把一份目录正文复制数百/数千次。与 legado 的
+/// `Book.putVariable` 语义一致，这些运行时绑定不应进入跨请求变量缓存。
 pub fn save_book_vars(ns: &str, source: &str, book_url: &str, vars: &RuleVars) {
     let key = (ns.to_string(), source.to_string(), book_url.to_string());
     let mut capped = RuleVars::new();
     let mut bytes = 0usize;
     for (k, v) in vars.iter() {
+        if matches!(k.as_str(), "result" | "src" | "baseUrl" | "key" | "page") {
+            continue;
+        }
         if capped.len() >= BOOK_VARS_ENTRIES_MAX {
             break;
         }
@@ -2901,11 +2909,21 @@ mod tests {
     fn test_book_vars_persistence_strips_context() {
         let mut vars = RuleVars::new();
         vars.insert("bid".to_string(), "42".to_string());
+        vars.insert("src".to_string(), "整份目录正文".to_string());
+        vars.insert("result".to_string(), "本次求值结果".to_string());
+        vars.insert("baseUrl".to_string(), "https://b.test/toc/1".to_string());
+        vars.insert("page".to_string(), "1".to_string());
         vars.chapter_title = Some("脏标题".to_string());
         vars.book_name = Some("脏书名".to_string());
         save_book_vars("ns-f12", "src-f12", "https://b.test/1", &vars);
         let loaded = load_book_vars("ns-f12", "src-f12", "https://b.test/1");
         assert_eq!(loaded.get("bid").map(String::as_str), Some("42"));
+        for key in ["src", "result", "baseUrl", "page"] {
+            assert!(
+                loaded.get(key).is_none(),
+                "一次规则求值上下文 {key} 不应持久化"
+            );
+        }
         assert!(loaded.chapter_title.is_none(), "章标题上下文不应持久化");
         assert!(loaded.book_name.is_none(), "书名上下文不应持久化");
     }
