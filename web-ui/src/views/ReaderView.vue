@@ -2961,6 +2961,21 @@ function reviewKeyAt(paragraphIndex: number): string {
   return keys[String(paragraphIndex + 1)] || keys[String(paragraphIndex)] || paragraphs.value[paragraphIndex] || String(paragraphIndex + 1)
 }
 
+/** 侧栏标题显示当前段的总评论数；统计缺失时退回当前已加载条数。 */
+function reviewTotalCount(): number {
+  const paragraphIndex = reviewParaIndex.value - 1
+  const summaryCount = paragraphIndex >= 0 ? reviewCountAt(paragraphIndex) : 0
+  return Math.max(summaryCount, reviewItems.value.length)
+}
+
+function reviewReplyLabel(item: ReviewItem, index: number): string {
+  const state = replyStateOf(item, index)
+  if (state?.loading) return '加载中…'
+  if (state?.hasMore === false) return '已显示全部回复'
+  if (state) return '显示更多回复'
+  return item.replyCount && item.replyCount > 0 ? `显示${item.replyCount}条回复` : '显示回复'
+}
+
 async function loadReviewSummary(chapterUrl: string): Promise<void> {
   const token = ++reviewSummaryToken
   reviewSummary.value = { counts: {}, keys: {} }
@@ -4201,8 +4216,8 @@ onBeforeUnmount(() => {
   <div
     ref="pageRef"
     class="reader-page"
-    :class="{ texture: effectiveTexture && !simpleMode, 'flip-layout': pageMode === 'flip' && isTextBook, 'chrome-hidden': chromeHidden, 'simple-mode': simpleMode, 'mobile-layout': mobileActive }"
-    :style="pageStyle"
+    :class="{ texture: effectiveTexture && !simpleMode, 'flip-layout': pageMode === 'flip' && isTextBook, 'chrome-hidden': chromeHidden, 'simple-mode': simpleMode, 'mobile-layout': mobileActive, 'review-open': reviewOpen }"
+    :style="[pageStyle, { '--reader-content-width': contentWidth }]"
   >
     <!-- GAP 149：顶部细进度条（scroll 比例，1px 强调色；点击可跳章） -->
     <button
@@ -4444,34 +4459,45 @@ onBeforeUnmount(() => {
             >
             <template v-for="(para, i) in visibleParagraphs" :key="i">
               <!-- 单张图片段落（GAP 102）：渲染图片，点击全屏查看 -->
-              <img
-                v-if="visibleParaImgs[i]"
-                v-lazy="visibleParaImgs[i] as string"
-                class="reader-img"
-                :alt="`正文图片 ${i + 1}`"
-                loading="lazy"
-                @click="openImgViewer(visibleParaImgs[i] as string)"
-              />
+              <template v-if="visibleParaImgs[i]">
+                <img
+                  v-lazy="visibleParaImgs[i] as string"
+                  class="reader-img"
+                  :alt="`正文图片 ${i + 1}`"
+                  loading="lazy"
+                  @click="openImgViewer(visibleParaImgs[i] as string)"
+                />
+                <div v-if="reviewCountAt(i) > 0" class="review-inline review-inline-image">
+                  <button
+                    type="button"
+                    class="review-inline-btn"
+                    :title="`查看本段 ${reviewCountAt(i)} 条段评`"
+                    @click.stop="openReview(i)"
+                  >
+                    {{ reviewCountAt(i) }}
+                  </button>
+                </div>
+              </template>
               <p
                 v-else
                 class="reader-para"
                 :data-para="i"
-                :class="{ flash: flashParaIdx === i, 'tts-reading': ttsReadingPara === i }"
+                :class="{ flash: flashParaIdx === i, 'tts-reading': ttsReadingPara === i, 'review-target': reviewOpen && reviewParaIndex === i + 1 }"
                 :style="{ marginBottom: `${paraSpacing}em`, textIndent: textIndent ? '2em' : '0' }"
               >
                 <span v-if="paraDisplayHtml(i) !== null" v-html="paraDisplayHtml(i)"></span>
                 <template v-else>{{ para }}</template>
-              </p>
-              <div v-if="reviewCountAt(i) > 0" class="review-inline">
                 <button
+                  v-if="reviewCountAt(i) > 0"
                   type="button"
                   class="review-inline-btn"
                   :title="`查看本段 ${reviewCountAt(i)} 条段评`"
+                  :aria-label="`查看本段 ${reviewCountAt(i)} 条段评`"
                   @click.stop="openReview(i)"
                 >
-                  💬 {{ reviewCountAt(i) }} 条段评
+                  {{ reviewCountAt(i) }}
                 </button>
-              </div>
+              </p>
             </template>
             </article>
           </div>
@@ -5999,35 +6025,38 @@ onBeforeUnmount(() => {
       </div>
     </transition>
 
-    <!-- 原生段评弹层：一级段评按需加载，回复按条目 page-only 分页 -->
-    <transition name="pop">
+    <!-- 原生段评侧栏：右侧常驻式评论面板，一级段评按需加载，回复按条目 page-only 分页 -->
+    <transition name="review-side">
       <div v-if="reviewOpen" class="review-mask" @click.self="closeReview">
         <section class="review-dialog" @click.stop>
           <header class="review-head">
-            <div>
-              <strong>段评</strong>
-              <span class="review-head-sub">第 {{ reviewParaIndex }} 段</span>
+            <div class="review-title">
+              <strong>评论</strong>
+              <span class="review-count">{{ reviewTotalCount() }}条</span>
             </div>
-            <button type="button" class="review-close" title="关闭" @click="closeReview">×</button>
+            <button type="button" class="review-close" title="关闭评论" aria-label="关闭评论" @click="closeReview">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                <path d="M6 6l12 12M18 6L6 18" />
+              </svg>
+            </button>
           </header>
           <div class="review-list">
-            <p v-if="reviewLoading && reviewItems.length === 0" class="review-state">段评加载中…</p>
+            <p v-if="reviewLoading && reviewItems.length === 0" class="review-state">评论加载中…</p>
             <p v-else-if="reviewError && reviewItems.length === 0" class="review-state review-error">{{ reviewError }}</p>
-            <p v-else-if="!reviewLoading && reviewItems.length === 0" class="review-state">暂无段评</p>
+            <p v-else-if="!reviewLoading && reviewItems.length === 0" class="review-state">暂无评论</p>
             <article v-for="(item, i) in reviewItems" :key="reviewItemKey(item, i)" class="review-item">
               <div class="review-meta">
                 <img v-if="item.avatar" class="review-avatar" :src="reviewMediaUrl(item.avatar)" alt="" loading="lazy" />
                 <span class="review-name">{{ item.name || '匿名读者' }}</span>
                 <span v-for="badge in item.badges" :key="badge" class="review-badge">{{ badge }}</span>
-                <time v-if="item.time" class="review-time">{{ item.time }}</time>
               </div>
               <p v-if="item.replyToName" class="review-reply-to">回复 @{{ item.replyToName }}</p>
               <p v-if="item.content" class="review-content">{{ item.content }}</p>
-              <img v-if="item.imageUrl" class="review-image" :src="reviewMediaUrl(item.imageUrl)" alt="段评配图" loading="lazy" />
-              <a v-if="item.audioUrl" class="review-audio" :href="item.audioUrl" target="_blank" rel="noopener noreferrer">播放段评语音</a>
+              <img v-if="item.imageUrl" class="review-image" :src="reviewMediaUrl(item.imageUrl)" alt="评论配图" loading="lazy" />
+              <a v-if="item.audioUrl" class="review-audio" :href="item.audioUrl" target="_blank" rel="noopener noreferrer">播放评论语音</a>
               <div class="review-item-foot">
-                <span v-if="typeof item.likeCount === 'number'">赞 {{ item.likeCount }}</span>
-                <span v-if="typeof item.replyCount === 'number'">{{ item.replyCount }} 条回复</span>
+                <time v-if="item.time" class="review-time">{{ item.time }}</time>
+                <span v-if="typeof item.likeCount === 'number'" class="review-like">♡ {{ item.likeCount }}</span>
                 <button
                   v-if="(item.replyCount || 0) > 0 || item.id"
                   type="button"
@@ -6035,7 +6064,7 @@ onBeforeUnmount(() => {
                   :disabled="replyStateOf(item, i)?.loading"
                   @click="loadReviewReplies(item, i)"
                 >
-                  {{ replyStateOf(item, i)?.loading ? '加载中…' : replyStateOf(item, i)?.hasMore === false ? '已加载完回复' : replyStateOf(item, i) ? '加载下一页回复' : '更多回复' }}
+                  {{ reviewReplyLabel(item, i) }}
                 </button>
               </div>
               <div v-if="item.replies.length || replyStateOf(item, i)?.items.length" class="review-replies">
@@ -6053,9 +6082,8 @@ onBeforeUnmount(() => {
           <footer class="review-foot">
             <span v-if="reviewError && reviewItems.length" class="review-error">{{ reviewError }}</span>
             <button v-if="reviewHasMore" type="button" class="review-more-btn" :disabled="reviewLoading" @click="loadMoreReview">
-              {{ reviewLoading ? '加载中…' : '加载下一页段评' }}
+              {{ reviewLoading ? '加载中…' : '加载更多评论' }}
             </button>
-            <button type="button" class="text-btn" @click="closeReview">关闭</button>
           </footer>
         </section>
       </div>
@@ -6130,6 +6158,7 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .reader-page {
+  --review-panel-width: min(360px, 88vw);
   min-height: 100vh;
   /* 阅读主题变量在 .reader-page[data-reader-theme] 上覆盖（与界面主题分离），此处显式取背景 */
   background: var(--bg);
@@ -7703,46 +7732,79 @@ onBeforeUnmount(() => {
   color: #cf4444;
 }
 
-/* ================= 原生段评 ================= */
-.review-inline {
-  display: flex;
-  justify-content: flex-end;
-  margin: -0.35em 0 0.8em;
-}
+/* ================= 原生段评：起点式右侧评论栏 ================= */
 .review-inline-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  margin-left: 5px;
+  padding: 0 4px;
   border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--border));
-  border-radius: 999px;
-  padding: 3px 10px;
+  border-radius: 4px;
   color: var(--accent);
   background: color-mix(in srgb, var(--accent) 7%, transparent);
   font: inherit;
-  font-size: 12px;
+  font-size: 11px;
+  line-height: 1;
+  vertical-align: 0.12em;
   cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
 }
 .review-inline-btn:hover {
   background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-color: var(--accent);
+}
+.review-inline-image {
+  display: flex;
+  justify-content: flex-end;
+  margin: -0.65em 0 0.5em;
+}
+.review-inline-image .review-inline-btn {
+  margin-right: 2px;
+}
+.reader-para.review-target {
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  border-radius: 3px;
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--accent) 32%, transparent);
 }
 .review-mask {
   position: fixed;
   inset: 0;
   z-index: 80;
-  display: flex;
-  align-items: flex-end;
-  justify-content: center;
-  padding: 20px;
-  background: rgba(24, 24, 27, 0.34);
+  background: rgba(24, 24, 27, 0.12);
 }
 .review-dialog {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
   display: flex;
   flex-direction: column;
-  width: min(760px, 100%);
-  max-height: min(82vh, 820px);
+  width: var(--review-panel-width);
+  max-height: none;
   overflow: hidden;
   color: var(--text);
   background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 18px 18px 10px 10px;
-  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.22);
+  border-left: 1px solid var(--border);
+  box-shadow: -10px 0 30px rgba(0, 0, 0, 0.11);
+}
+.review-side-enter-active,
+.review-side-leave-active {
+  transition: opacity 0.22s ease;
+}
+.review-side-enter-active .review-dialog,
+.review-side-leave-active .review-dialog {
+  transition: transform 0.22s ease;
+}
+.review-side-enter-from,
+.review-side-leave-to {
+  opacity: 0;
+}
+.review-side-enter-from .review-dialog,
+.review-side-leave-to .review-dialog {
+  transform: translateX(100%);
 }
 .review-head,
 .review-foot {
@@ -7751,47 +7813,67 @@ onBeforeUnmount(() => {
   justify-content: space-between;
   gap: 12px;
   flex-shrink: 0;
-  padding: 13px 18px;
+  padding: 18px 20px 14px;
   border-bottom: 1px solid var(--border);
 }
-.review-foot {
-  justify-content: flex-end;
-  border-top: 1px solid var(--border);
-  border-bottom: 0;
+.review-title {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
 }
-.review-head-sub {
-  margin-left: 8px;
+.review-title strong {
+  color: var(--text-1);
+  font-size: 18px;
+  font-weight: 500;
+  letter-spacing: 0.5px;
+}
+.review-count {
   color: var(--muted);
-  font-size: 12px;
-  font-weight: 400;
+  font-size: 11px;
 }
 .review-close {
-  width: 30px;
-  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
   border: 0;
+  border-radius: 50%;
   color: var(--muted);
   background: transparent;
-  font-size: 24px;
-  line-height: 1;
   cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+.review-close:hover {
+  color: var(--text-1);
+  background: color-mix(in srgb, var(--text-1) 8%, transparent);
+}
+.review-close svg {
+  width: 16px;
+  height: 16px;
 }
 .review-list {
+  flex: 1;
   min-height: 120px;
   overflow: auto;
-  padding: 6px 18px 12px;
+  padding: 0 20px 12px;
+  scrollbar-width: thin;
 }
 .review-state {
+  margin: 0;
   padding: 32px 8px;
   color: var(--muted);
   text-align: center;
 }
 .review-error,
 .review-reply-error {
+  margin: 5px 0 0;
   color: #cf4444;
   font-size: 12px;
 }
 .review-item {
-  padding: 14px 0;
+  padding: 15px 0 14px;
   border-bottom: 1px solid var(--border);
 }
 .review-item:last-child {
@@ -7804,8 +7886,8 @@ onBeforeUnmount(() => {
   min-width: 0;
 }
 .review-avatar {
-  width: 28px;
-  height: 28px;
+  width: 26px;
+  height: 26px;
   flex: 0 0 auto;
   border-radius: 50%;
   object-fit: cover;
@@ -7813,9 +7895,9 @@ onBeforeUnmount(() => {
 }
 .review-name {
   overflow: hidden;
-  color: var(--text);
-  font-size: 13px;
-  font-weight: 600;
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -7826,32 +7908,37 @@ onBeforeUnmount(() => {
   background: color-mix(in srgb, var(--accent) 10%, transparent);
   font-size: 10px;
 }
-.review-time {
-  margin-left: auto;
+.review-reply-to,
+.review-content,
+.review-image,
+.review-audio,
+.review-item-foot {
+  margin-left: 33px;
+}
+.review-reply-to {
+  margin: 7px 0 0 33px;
   color: var(--muted);
   font-size: 11px;
 }
-.review-reply-to {
-  margin: 8px 0 0;
-  color: var(--muted);
-  font-size: 12px;
-}
 .review-content {
-  margin: 8px 0 0;
+  margin: 7px 0 0 33px;
+  color: var(--text-1);
+  font-size: 13px;
+  line-height: 1.65;
   white-space: pre-wrap;
   word-break: break-word;
 }
 .review-image {
   display: block;
-  max-width: min(100%, 360px);
-  max-height: 300px;
-  margin-top: 9px;
-  border-radius: 8px;
+  max-width: calc(100% - 33px);
+  max-height: 260px;
+  margin: 9px 0 0 33px;
+  border-radius: 7px;
   object-fit: contain;
 }
 .review-audio {
   display: inline-block;
-  margin-top: 8px;
+  margin: 8px 0 0 33px;
   color: var(--accent);
   font-size: 12px;
 }
@@ -7863,17 +7950,31 @@ onBeforeUnmount(() => {
   color: var(--muted);
   font-size: 11px;
 }
+.review-like {
+  margin-left: auto;
+  white-space: nowrap;
+}
+.review-time {
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
 .review-reply-btn,
 .review-more-btn {
-  margin-left: auto;
-  padding: 4px 9px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--accent);
+  margin-left: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  color: var(--muted);
   background: transparent;
   font: inherit;
   font-size: 11px;
   cursor: pointer;
+  white-space: nowrap;
+}
+.review-reply-btn:hover:not(:disabled),
+.review-more-btn:hover:not(:disabled) {
+  color: var(--accent);
 }
 .review-reply-btn:disabled,
 .review-more-btn:disabled {
@@ -7881,20 +7982,21 @@ onBeforeUnmount(() => {
   opacity: 0.55;
 }
 .review-replies {
-  margin: 10px 0 0 35px;
-  padding-left: 11px;
+  margin: 10px 0 0 33px;
+  padding: 6px 10px;
   border-left: 2px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  background: color-mix(in srgb, var(--bg) 55%, transparent);
 }
 .review-reply {
   padding: 5px 0;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
 }
 .review-reply b {
-  color: var(--text);
+  color: var(--text-2);
 }
 .review-reply-image {
   display: block;
@@ -7902,6 +8004,25 @@ onBeforeUnmount(() => {
   max-height: 180px;
   margin-top: 5px;
   border-radius: 6px;
+}
+.review-foot {
+  justify-content: center;
+  min-height: 52px;
+  padding: 12px 20px max(12px, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--border);
+  border-bottom: 0;
+}
+
+/* 桌面端为评论栏让出右侧空间，正文仍按用户设置的栏宽居中在左侧阅读区。 */
+@media (min-width: 721px) {
+  .reader-page.review-open .reader-main {
+    width: calc(100% - var(--review-panel-width));
+    max-width: none !important;
+    margin-left: 0;
+    margin-right: 0;
+    padding-left: max(24px, calc((100% - var(--review-panel-width) - var(--reader-content-width)) / 2));
+    padding-right: max(24px, calc((100% - var(--review-panel-width) - var(--reader-content-width)) / 2));
+  }
 }
 
 /* ================= 章节侧栏 ================= */
@@ -8645,6 +8766,31 @@ onBeforeUnmount(() => {
   .progress-bar {
     padding: 0 12px 10px;
     padding-bottom: max(10px, env(safe-area-inset-bottom));
+  }
+  /* 手机上保留底部抽屉，避免评论栏挤压正文阅读宽度。 */
+  .review-mask {
+    background: rgba(24, 24, 27, 0.2);
+  }
+  .review-dialog {
+    top: auto;
+    width: 100%;
+    height: min(82vh, 720px);
+    border-top: 1px solid var(--border);
+    border-left: 0;
+    border-radius: 18px 18px 0 0;
+  }
+  .review-list {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+  .review-head,
+  .review-foot {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+  .review-side-enter-from .review-dialog,
+  .review-side-leave-to .review-dialog {
+    transform: translateY(100%);
   }
 }
 </style>
