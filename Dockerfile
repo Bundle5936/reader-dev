@@ -44,6 +44,7 @@ RUN apt-get update \
         fonts-noto-cjk \
         python3 \
         python3-pip \
+        libheif-examples \
     && rm -rf /var/lib/apt/lists/*
 
 # camoufox 运行时系统库（Firefox 内核——playwright firefox 依赖集）+ tini（ENTRYPOINT 入口）

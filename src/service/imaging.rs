@@ -11,6 +11,75 @@
 
 use anyhow::{anyhow, Result};
 
+/// HEIF/HEIC Content-Type 判断（libheif 负责解码，image crate 不含 HEIF 解码器）。
+pub fn is_heif_content_type(content_type: Option<&str>) -> bool {
+    content_type
+        .and_then(|value| value.split(';').next())
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "image/heic" | "image/heif" | "image/heic-sequence" | "image/heif-sequence"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// 使用运行镜像内的 libheif `heif-convert` 将 HEIC 转为 JPEG。
+///
+/// Fanqie 段评头像/配图目前返回 `image/heic`，Chrome/Android WebView 通常不能直接
+/// 解码；转换失败时返回 None，由调用方保留原图回退。输入大小由图片代理的 5 MiB
+/// 上限控制，`heif-convert` 默认安全限制不被关闭，且单次转换有超时。
+pub async fn heif_to_jpeg(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let dir = std::env::temp_dir();
+    let input = dir.join(format!("reader-heif-{id}.heic"));
+    let output = dir.join(format!("reader-heif-{id}.jpg"));
+
+    let converted = async {
+        tokio::fs::write(&input, bytes).await.ok()?;
+        let command = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::process::Command::new("heif-convert")
+                .args(["--quiet", "-q", "82"])
+                .arg(&input)
+                .arg(&output)
+                .output(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if !command.status.success() {
+            tracing::debug!(
+                "HEIF 转 JPEG 失败: {}",
+                String::from_utf8_lossy(&command.stderr)
+                    .trim()
+                    .chars()
+                    .take(300)
+                    .collect::<String>()
+            );
+            return None;
+        }
+        let jpeg = tokio::fs::read(&output).await.ok()?;
+        // JPEG 最小合法头 + 输出上限，避免异常转换结果继续进入响应。
+        if jpeg.len() < 3
+            || !jpeg.starts_with(&[0xff, 0xd8, 0xff])
+            || jpeg.len() > 10 * 1024 * 1024
+        {
+            return None;
+        }
+        Some(jpeg)
+    }
+    .await;
+
+    let _ = tokio::fs::remove_file(&input).await;
+    let _ = tokio::fs::remove_file(&output).await;
+    converted
+}
+
 /// 解码尺寸上限（单边，px）——超限拒绝转码（防解压炸弹）
 pub const MAX_IMAGE_DIMENSION: u32 = 8000;
 /// 解码总像素上限（8000x8000 = 64MP 也会超此限；40MP ≈ 160MB RGBA 展开）
@@ -60,6 +129,15 @@ pub fn to_webp(bytes: &[u8], quality: u8) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_heif_content_type() {
+        assert!(is_heif_content_type(Some("image/heic")));
+        assert!(is_heif_content_type(Some("image/heif; charset=binary")));
+        assert!(is_heif_content_type(Some("IMAGE/HEIC-SEQUENCE")));
+        assert!(!is_heif_content_type(Some("image/jpeg")));
+        assert!(!is_heif_content_type(None));
+    }
 
     /// 生成 4x4 PNG 测试图 → webp 转码：RIFF/WEBP 头 + 可解码回原尺寸
     #[test]

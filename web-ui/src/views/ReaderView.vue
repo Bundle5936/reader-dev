@@ -132,6 +132,22 @@ interface ReviewReplyState {
   error: string
 }
 const reviewReplies = ref<Record<string, ReviewReplyState>>({})
+
+/** 段评媒体统一走同源代理：Fanqie 头像/配图常为 HEIC，浏览器端无法直接解码；
+ * 同时带当前会话 token，让 secure 模式下的 /assets/proxy 可以鉴权并转 WebP。 */
+function reviewMediaUrl(url: string | null | undefined): string | undefined {
+  if (!url) return undefined
+  if (!/^https?:\/\//i.test(url)) return url
+  const params = new URLSearchParams({
+    url,
+    referer: 'https://fanqienovel.com/',
+    fmt: 'webp',
+    q: '82',
+  })
+  if (store.accessToken) params.set('accessToken', store.accessToken)
+  return `/assets/proxy?${params.toString()}`
+}
+
 const notFound = ref(false)
 const drawerOpen = ref(false)
 /** 临时书详情（init 中与目录并行拉取——退出挽留入架时补全作者/封面/目录等字段） */
@@ -6000,14 +6016,14 @@ onBeforeUnmount(() => {
             <p v-else-if="!reviewLoading && reviewItems.length === 0" class="review-state">暂无段评</p>
             <article v-for="(item, i) in reviewItems" :key="reviewItemKey(item, i)" class="review-item">
               <div class="review-meta">
-                <img v-if="item.avatar" class="review-avatar" :src="item.avatar" alt="" loading="lazy" />
+                <img v-if="item.avatar" class="review-avatar" :src="reviewMediaUrl(item.avatar)" alt="" loading="lazy" />
                 <span class="review-name">{{ item.name || '匿名读者' }}</span>
                 <span v-for="badge in item.badges" :key="badge" class="review-badge">{{ badge }}</span>
                 <time v-if="item.time" class="review-time">{{ item.time }}</time>
               </div>
               <p v-if="item.replyToName" class="review-reply-to">回复 @{{ item.replyToName }}</p>
               <p v-if="item.content" class="review-content">{{ item.content }}</p>
-              <img v-if="item.imageUrl" class="review-image" :src="item.imageUrl" alt="段评配图" loading="lazy" />
+              <img v-if="item.imageUrl" class="review-image" :src="reviewMediaUrl(item.imageUrl)" alt="段评配图" loading="lazy" />
               <a v-if="item.audioUrl" class="review-audio" :href="item.audioUrl" target="_blank" rel="noopener noreferrer">播放段评语音</a>
               <div class="review-item-foot">
                 <span v-if="typeof item.likeCount === 'number'">赞 {{ item.likeCount }}</span>
@@ -6028,7 +6044,7 @@ onBeforeUnmount(() => {
                 </div>
                 <div v-for="(reply, ri) in replyStateOf(item, i)?.items || []" :key="`page-${reviewItemKey(reply, ri)}`" class="review-reply">
                   <b>{{ reply.name || '匿名读者' }}</b><span v-if="reply.replyToName"> 回复 @{{ reply.replyToName }}</span>：{{ reply.content }}
-                  <img v-if="reply.imageUrl" class="review-reply-image" :src="reply.imageUrl" alt="回复配图" loading="lazy" />
+                  <img v-if="reply.imageUrl" class="review-reply-image" :src="reviewMediaUrl(reply.imageUrl)" alt="回复配图" loading="lazy" />
                 </div>
                 <p v-if="replyStateOf(item, i)?.error" class="review-reply-error">{{ replyStateOf(item, i)?.error }}</p>
               </div>

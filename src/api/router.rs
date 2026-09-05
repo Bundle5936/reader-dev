@@ -624,6 +624,18 @@ async fn assets_proxy(
             } else {
                 "public, max-age=3600"
             };
+            // Fanqie 段评头像/配图常返回 image/heic；浏览器端通常不能直接显示，
+            // 先借助运行镜像内的 libheif 转 JPEG，再按请求继续转 WebP。
+            let (bytes, content_type) = if crate::service::imaging::is_heif_content_type(
+                content_type.as_deref(),
+            ) {
+                match crate::service::imaging::heif_to_jpeg(&bytes).await {
+                    Some(jpeg) => (jpeg, Some("image/jpeg".to_string())),
+                    None => (bytes, content_type),
+                }
+            } else {
+                (bytes, content_type)
+            };
             let is_raster = content_type
                 .as_deref()
                 .map(|ct| ct.starts_with("image/"))
