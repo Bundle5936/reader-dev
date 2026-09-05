@@ -2345,6 +2345,10 @@ function readerAreaOverlayOpen(): boolean {
  * 中间=唤出/收起菜单；滚动模式逐屏滚动，上下/仿真/左右模式沿用各自翻页语义
  */
 function onReaderAreaClick(e: MouseEvent) {
+  if (reviewOpen.value) {
+    closeReview()
+    return
+  }
   if (readerClickMode.value === 'none' || readerAreaOverlayOpen()) return
   const t = e.target
   if (
@@ -3033,6 +3037,10 @@ function mergeReviewItems(current: ReviewItem[], incoming: ReviewItem[]): Review
 }
 
 async function openReview(paragraphIndex: number): Promise<void> {
+  if (reviewOpen.value && reviewParaIndex.value === paragraphIndex + 1) {
+    closeReview()
+    return
+  }
   if (reviewCountAt(paragraphIndex) <= 0 || !currentChapter.value) return
   reviewParaIndex.value = paragraphIndex + 1
   reviewParaData.value = reviewKeyAt(paragraphIndex)
@@ -4128,6 +4136,12 @@ function onKeydown(e: KeyboardEvent) {
       if (imgViewerOpen.value) {
         e.preventDefault()
         closeImgViewer()
+        return
+      }
+      if (reviewOpen.value) {
+        e.preventDefault()
+        closeReview()
+        return
       }
       break
   }
@@ -7780,7 +7794,8 @@ onBeforeUnmount(() => {
   position: fixed;
   inset: 0;
   z-index: 80;
-  background: color-mix(in srgb, var(--text-1) 12%, transparent);
+  background: transparent;
+  pointer-events: none;
 }
 .review-dialog {
   position: absolute;
@@ -7796,6 +7811,7 @@ onBeforeUnmount(() => {
   background: var(--surface);
   border-left: 1px solid var(--border);
   box-shadow: -8px 0 28px rgba(0, 0, 0, 0.18);
+  pointer-events: auto;
 }
 .review-side-enter-active,
 .review-side-leave-active {
