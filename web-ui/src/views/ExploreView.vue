@@ -217,7 +217,7 @@
                 <span class="book-cover" :style="{ background: coverGradient(b.name) }">
                   <img
                     v-if="b.coverUrl && !failedCovers.has(b.bookUrl)"
-                    :src="b.coverUrl"
+                    :src="proxyImageUrl(b.coverUrl, { force: true }) ?? ''"
                     :alt="b.name"
                     loading="lazy"
                     class="cover-img"
@@ -258,6 +258,7 @@ import { useRouter } from 'vue-router'
 import TopNav from '@/components/TopNav.vue'
 import { getExploreSources, getExploreUrls, exploreBook } from '@/api/explore'
 import { clearSearchHistory, loadSearchHistory, pushSearchHistory } from '@/utils/searchHistory'
+import { proxyImageUrl } from '@/utils/imageProxy'
 import type { BookSource, ExploreCategory, ExploreSourceInfo, SearchBook } from '@/types'
 
 const router = useRouter()
