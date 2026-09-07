@@ -219,6 +219,14 @@ pub fn build_explore_url(url: &str, page: i64) -> String {
         .replace("{page}", &page.to_string())
 }
 
+/// 解析探索请求地址：以书源 URL 为基准解析绝对/根相对/普通相对地址。
+/// 根相对 URL（如 `/explore?kind=bookshelf`）必须回到 origin，不能拼成
+/// `.../source-native/explore`；这与 Legado `NetworkUtils.getAbsoluteURL` 一致。
+fn resolve_explore_request_url(url: &str, source_url: &str) -> String {
+    let base = source_url.split("##").next().unwrap_or("").trim();
+    crate::service::search::to_absolute(url, base)
+}
+
 /// 单页发现：抓取 + 解析（复用搜索的 SearchRule 语义）
 ///
 /// GAP #51：page 参数由服务端替换书源分页变量（{{page}}/{page}，URL 与 POST body）
@@ -230,18 +238,8 @@ pub async fn explore_url(
 ) -> Result<Vec<SearchBook>> {
     // URL 模板（{{page}}/{page}）→ 页码
     let url = build_explore_url(url, page);
-    // 相对 URL 拼书源 baseUrl
-    let raw_url = if url.starts_with('/') && !url.starts_with("//") {
-        let base = source
-            .book_source_url
-            .split("##")
-            .next()
-            .unwrap_or("")
-            .trim_end_matches('/');
-        format!("{base}{url}")
-    } else {
-        url.to_string()
-    };
+    // 相对 URL 按 Legado 语义解析：根相对路径回到书源 origin。
+    let raw_url = resolve_explore_request_url(&url, &source.book_source_url);
     // URL 后缀（,{...}：charset/method/body——对齐搜索链路）
     let (final_url, suffix) = crate::service::search::split_url_suffix(&raw_url);
     let mut headers = source
@@ -530,6 +528,31 @@ mod tests {
         // 无 url 条目丢弃
         let js = "@js:[{title:'空',url:''}]";
         assert!(parse_explore_entries(js).is_empty());
+    }
+
+    #[test]
+    fn test_resolve_explore_request_url_uses_origin_for_root_relative_paths() {
+        assert_eq!(
+            resolve_explore_request_url(
+                "/explore?kind=bookshelf",
+                "http://10.0.0.4:7822/source-native"
+            ),
+            "http://10.0.0.4:7822/explore?kind=bookshelf"
+        );
+        assert_eq!(
+            resolve_explore_request_url(
+                "explore?kind=hot",
+                "http://10.0.0.4:7822/source-native"
+            ),
+            "http://10.0.0.4:7822/explore?kind=hot"
+        );
+        assert_eq!(
+            resolve_explore_request_url(
+                "/explore?kind=bookshelf",
+                "http://10.0.0.4:7822/source-native##备注"
+            ),
+            "http://10.0.0.4:7822/explore?kind=bookshelf"
+        );
     }
 
     /// GAP #51：分页变量替换（{{page}}/{page} 双格式，URL 与 POST body 一致）
